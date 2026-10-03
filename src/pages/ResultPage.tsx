@@ -215,6 +215,8 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
   const [jumpWarn, setJumpWarn] = useState<{ jumpUrl: string; folderPath: string; originalTitle: string } | null>(null);
   // v1.1.7 隐秘参数：<> 按钮弹窗（确认后新标签直连官方 API，url 在 open 时算好）
   const [hiddenVolumn, setHiddenVolumn] = useState<{ url: string; title: string; body: string } | null>(null);
+  /** v1.4：文件级隐秘参数（解析后可就地看的脱敏详情；不发请求） */
+  const [fileHidden, setFileHidden] = useState<{ title: string; rows: Array<{ label: string; value: string }> } | null>(null);
   // v1.1.7 导出包含黄色标记 → 弹窗模式（设置开关控制，关=简略 toast）
   const [exportYellow, setExportYellow] = useState(false);
   // v1.1.7 折叠状态恢复询问弹窗
@@ -465,10 +467,23 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
       let results: LinkResult[] = [];
       if (toFetch.length > 0) {
         addGlobalLog(`prase：发起接口请求 ${toFetch.length} 个（15/批 + 1s 节流）`);
+        // v1.4 逐文件进度：onProgress 的 total 是**本批**文件数（core 内部 15/批），
+        // 这里按「批切换时把上一批 done 累加为偏移」换算成整体进度（沿用现有进度条，不新造 UI）。
+        let progBase = 0;
+        let progLastDone = 0;
         results = await fetchLinks(
           { adapter, shareId, stoken, guestMode },
           toFetch,
-          { batchSize: 15, batchIntervalMs: 1000, continueOnError: true },
+          {
+            batchSize: 15,
+            batchIntervalMs: 1000,
+            continueOnError: true,
+            onProgress: (e) => {
+              if (e.done < progLastDone) progBase += progLastDone; // 新批：本批 done 归零 → 累加偏移
+              progLastDone = e.done;
+              setFetchProgress({ done: Math.min(progBase + e.done, toFetch.length), total: toFetch.length });
+            },
+          },
         );
         addGlobalLog(`prase：接口完成 — ${results.filter((r) => r.ok).length}/${toFetch.length} 成功`);
       }
@@ -832,6 +847,22 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
     }
   };
 
+  /* ---------- v1.4 文件级隐秘参数（迅雷）：解析后展示脱敏详情，不发请求 ---------- */
+  const openFileHiddenVolumn = (fid: string): void => {
+    const cap = adapter.fileHiddenVolumn;
+    if (!cap) {
+      toast('该网盘暂不支持文件级隐秘参数', 'error');
+      return;
+    }
+    const rows = cap.view(fid);
+    if (!rows) {
+      toast(cap.emptyHint, 'info');
+      return;
+    }
+    addGlobalLog(`${hhmmss(Date.now())} 隐秘参数（文件）：${leafNodeOf(fid)?.path ?? fid}（就地展示脱敏字段，不发请求）`);
+    setFileHidden({ title: cap.title, rows });
+  };
+
   /* ---------- 导出（浏览器直连/复制直链已移除：UC referer 白名单拒绝第三方源，§10.1.4） ---------- */
   const buildExportFiles = (): ExportFile[] => {
     // v1.1.5：curl 也支持保留目录结构（--create-dirs）；仅导出可用的直链（绿+黄，上游过期时间内）
@@ -1172,6 +1203,8 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
             dirProps={dirProps}
             onHiddenVolumn={openHiddenVolumn}
             showHiddenVolumn={prefs.advanced.enabled && prefs.advanced.showHiddenVolumn}
+            showFileHiddenVolumn={prefs.xunlei.fileHiddenVolumn && Boolean(adapter.fileHiddenVolumn)}
+            onFileHiddenVolumn={openFileHiddenVolumn}
             showEtag={prefs.showEtag}
             showLinkDetail={prefs.showLinkDetail}
           />
@@ -1350,6 +1383,37 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
             retryAfterCredentialSave(Boolean(plan.merged));
           }}
         />
+      )}
+      {/* v1.4 文件级隐秘参数弹窗（脱敏字段就地表，不发请求） */}
+      {fileHidden && (
+        <div className="modal-mask" onClick={() => setFileHidden(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
+            <div className="modal-head">
+              <h3 className="modal-title">{fileHidden.title}</h3>
+              <button type="button" className="modal-close" onClick={() => setFileHidden(null)} aria-label="关闭">
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, color: 'var(--text-dim)' }}>
+                以下字段来自该文件最近一次解析（prase）的详情响应，已脱敏：不含 Authorization、captcha_token，
+                直链只报存在性与过期时间。可用于判断后端账号是不是会员号（vip / token_type）。
+              </p>
+              <div className="table-wrap" style={{ marginTop: 8 }}>
+                <table className="uac-table">
+                  <tbody>
+                    {fileHidden.rows.map((r) => (
+                      <tr key={r.label}>
+                        <td style={{ whiteSpace: 'nowrap' }}>{r.label}</td>
+                        <td style={{ wordBreak: 'break-all' }}>{r.value}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
       {/* v1.1.7 隐秘参数弹窗（确认后新标签直连官方 API，no-referer） */}
       {hiddenVolumn && (

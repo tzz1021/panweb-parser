@@ -93,6 +93,17 @@ export interface ListResult {
  * 缺 per-file 令牌 / 不支持的文件（如目录）由适配器在对应下标产出失败项
  * （DownloadResult.error + errorCode，core linkFetcher 原样回填）。
  */
+/**
+ * 解析进度事件（v1.4）：**只报进度，不影响结果与顺序**。
+ * `total` = 本批文件数；`done` = 本批已完成数（失败也算完成，保证进度不卡）。
+ */
+export interface LinkProgressEvent {
+  done: number;
+  total: number;
+  fid: string;
+  stage?: 'probe' | 'settings' | 'restore' | 'rename' | 'download';
+}
+
 export interface DownloadParams {
   /** 本批待解析的文件（顺序即回填顺序；调用方保证只传文件，目录由适配器兜底拒绝） */
   files: ShareFile[];
@@ -103,6 +114,11 @@ export interface DownloadParams {
    * 改用游客 __pugs 发起请求（夸克 <50MB 小文件；其他网盘忽略）。
    */
   guestMode?: boolean;
+  /**
+   * v1.4 逐文件进度（可选；适配器**只报**，不得据此改变结果与顺序）。
+   * 由 core/linkFetcher 从 LinkFetchOptions.onProgress 原样透传（UI 动态进度条用）。
+   */
+  onProgress?: (evt: LinkProgressEvent) => void;
 }
 
 /** 单文件直链结果 */
@@ -184,6 +200,21 @@ export interface PanLimits {
   downloadStrategyNote?: string;
   /** download_url 额外说明（需要的 cookie / referer 等） */
   downloadUrlNote?: string;
+}
+
+/**
+ * v1.4：文件级「隐秘参数」能力（目前仅迅雷）。
+ * 与 `hiddenVolumn`（文件夹版，开新标签直连官方 API）的区别：
+ * **不发任何请求、不开外部链接**，就地展示最近一次 prase 详情响应的**脱敏**视图，
+ * 供开发者判断后端账号是不是会员号（vip / token_type）等。
+ */
+export interface FileHiddenVolumnView {
+  /** 弹窗标题 */
+  readonly title: string;
+  /** 点按钮但该文件还没解析时的提示（如「请先解析该文件」） */
+  readonly emptyHint: string;
+  /** 取某文件的脱敏字段行；未解析返回 null */
+  view(fid: string): Array<{ label: string; value: string }> | null;
 }
 
 /**
@@ -352,10 +383,21 @@ export interface PanAdapter {
   /** 解析跳转长链接：返回 shareId + fid 链；非跳转链接返回 null */
   parseJumpUrl?(url: string): { shareId: ShareId; segments: Array<{ fid: string; name: string }> } | null;
   /**
+   * v1.3.3 深链（按名字路径）→ 目标文件夹 fid 解析（可选；缺省 = 该网盘不支持深链解析）。
+   * 语义：`path` 是名字段（如 ['软件整合包','录屏神器 bandicam']）；实现逐层 list 按 fileName
+   * **精确匹配**下钻，命中最后一段返回其 fid。找不到 → 抛可读中文错误（不得静默回退到根）。
+   * 用途：HomePage 的 jump 流程（深链不带 fid 时，先解析出 rootFile.fid 再走现有快照拉取）。
+   */
+  resolveJumpPath?(params: { shareId: ShareId; stoken: string; path: string[] }): Promise<{ fid: string; name: string }>;
+  /**
    * 隐秘参数静态话术（v1.1.7）：开发者功能弹窗展示的各网盘字段说明；
    * 属于静态资源（放各网盘子目录），缺省 = 不提供该功能。
    */
   readonly hiddenVolumn?: { title: string; body: string };
+  /**
+   * v1.4：文件级「隐秘参数」（解析后可就地查看脱敏详情字段，不发请求）；缺省 = 不提供。
+   */
+  readonly fileHiddenVolumn?: FileHiddenVolumnView;
   /**
    * v1.1.7 隐秘参数：构造官方 API 查询 URL（浏览器直连，**不走代理**）；
    * 用缓存 stoken + 文件夹 fid 当 pdir_fid；缺省 = 不提供。

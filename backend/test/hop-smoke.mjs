@@ -17,11 +17,38 @@ const check = (name, cond, extra = '') => {
 // 清空旧数据（隔离测试环境）
 rmSync(DATA, { recursive: true, force: true });
 
+// v1.4：迅雷 captcha init 的本地 mock 上游（**绝不打真上游**）——backend 用 env 覆盖基址
+const mockHits = [];
+const mockSrv = http.createServer((mq, mres) => {
+  let b = '';
+  mq.on('data', (c) => { b += c; });
+  mq.on('end', () => {
+    mockHits.push({ url: mq.url, method: mq.method, headers: mq.headers, body: b });
+    const json = (obj) => { mres.writeHead(200, { 'content-type': 'application/json' }); mres.end(JSON.stringify(obj)); };
+    const u = String(mq.url ?? '');
+    if (u.includes('/v1/shield/captcha/init')) return json({ captcha_token: `mock-token-${mockHits.length}`, expires_in: 300 });
+    if (u.includes('/drive/v1/settings')) return json({});
+    if (u.includes('/drive/v1/share/restore')) return json({ share_status: 'OK', params: { trace_file_ids: JSON.stringify({ s1: 'my1', s2: 'my2' }) } });
+    if (mq.method === 'PATCH' && u.includes('/drive/v1/files/')) return json({ id: 'x', name: 'renamed.007' });
+    if (u.includes('/drive/v1/files/zipped')) return json({ id: 'zipped', mime_type: 'application/zip', size: '10', links: {} });
+    if (u.includes('/drive/v1/files/')) {
+      return json({
+        id: 'my1', name: 'a.pdf', size: '10', mime_type: 'application/pdf',
+        links: { 'application/pdf': { url: 'https://dl/mock?e=1800000000', token: 'JWTTOKEN', expire: '2026-10-03T20:00:00+08:00', token_type: 'TOKEN_TYPE_ACCELERATION' } },
+        web_content_link: 'https://wc/mock', params: { device_id: 'dev-mock', share_id: 'S', task_id: 't' }, vip: 'FREE', hash: 'h', md5_checksum: '',
+      });
+    }
+    return json({});
+  });
+});
+await new Promise((r) => mockSrv.listen(0, '127.0.0.1', r));
+const mockPort = mockSrv.address().port;
+
 // 启动 backend（固定端口 + 关 autoSpawn 避免拉起 wrangler）
 const port = 18881;
 const child = spawn(process.execPath, ['src/index.js', '--port', String(port)], {
   cwd: BACKEND,
-  env: { ...process.env, PANHUB_NO_SPAWN: '1' },
+  env: { ...process.env, PANHUB_NO_SPAWN: '1', PANHUB_XUNLEI_CAPTCHA_BASE: `http://127.0.0.1:${mockPort}`, PANHUB_XUNLEI_API_BASE: `http://127.0.0.1:${mockPort}` },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let out = '';
@@ -198,6 +225,81 @@ r = await fetch(`${base}/api/web/hosts`, { headers: { 'x-webui-token': webuiToke
 const hosts = await r.json();
 check('hosts list 包含新增', hosts.hosts?.some((h) => h.host === 'drive.quark.cn'));
 
+// ⑩.5 v1.4 迅雷 captcha_token 端点（X-Proxy-Token）+ sign 设置（上游走本地 mock，不打真机）
+check('xunlei hosts 种子映射（api-pan/xluser-ssl → xunlei）', hosts.hosts?.some((h) => h.host === 'api-pan.xunlei.com' && h.pan === 'xunlei') && hosts.hosts?.some((h) => h.host === 'xluser-ssl.xunlei.com' && h.pan === 'xunlei'), JSON.stringify(hosts.hosts));
+
+const xlNoToken = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'post:/drive/v1/share/restore' }) });
+check('xunlei captcha-token 无令牌 → 401', xlNoToken.status === 401, `status=${xlNoToken.status}`);
+
+const xlBadAction = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'not-an-action' }) });
+check('xunlei captcha-token 非法 action → 400', xlBadAction.status === 400, `status=${xlBadAction.status}`);
+
+const xlUnconfigured = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'post:/drive/v1/share/restore' }) });
+const xlUncfgBody = await xlUnconfigured.json();
+check('未配 sign → 400 + 中文明确错误（不静默）', xlUnconfigured.status === 400 && xlUncfgBody.error === 'XUNLEI_NOT_CONFIGURED' && /captcha_sign/.test(xlUncfgBody.message ?? ''), JSON.stringify(xlUncfgBody));
+check('未配 sign 时未打上游（mock 零请求）', mockHits.length === 0, `mockHits=${mockHits.length}`);
+check('未配 sign 时不回传 sign / device_id', xlUncfgBody.captcha_sign === undefined && xlUncfgBody.device_id === undefined, JSON.stringify(xlUncfgBody));
+
+// 录入假 sign（测试只断言请求形状/降级，不打真上游）
+const fakeDevice = 'a'.repeat(32);
+r = await fetch(`${base}/api/web/settings`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ xunlei: { captcha_sign: '1.fakesign', captcha_timestamp: '1700000000000', device_id: fakeDevice } }),
+});
+check('迅雷 captcha 设置写入', r.ok, `status=${r.status}`);
+const xlSettings = await (await fetch(`${base}/api/web/settings`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('settings 回 xunlei 脱敏视图（有 sign 但不回明文）', xlSettings.xunlei?.captchaSignSet === true && !JSON.stringify(xlSettings.xunlei).includes('1.fakesign'), JSON.stringify(xlSettings.xunlei));
+
+const xlOk = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'post:/drive/v1/share/restore' }) });
+const xlOkBody = await xlOk.json();
+check('配 sign 后拿到 token（fresh）', xlOk.ok && xlOkBody.captcha_token === 'mock-token-1' && xlOkBody.cached === false, JSON.stringify(xlOkBody));
+check('响应只含 token 三件套（sign/device_id 永不出接口）', !('captcha_sign' in xlOkBody) && !('device_id' in xlOkBody) && xlOkBody.expires_in === 300, JSON.stringify(xlOkBody));
+check('上游请求形状：captcha/init + 手动录入的 sign/timestamp/device 原样使用', mockHits.length === 1 && mockHits[0].url === '/v1/shield/captcha/init' && mockHits[0].method === 'POST' && (() => { const b = JSON.parse(mockHits[0].body); return b.action === 'post:/drive/v1/share/restore' && b.device_id === fakeDevice && b.meta?.captcha_sign === '1.fakesign' && b.meta?.timestamp === '1700000000000' && b.meta?.package_name === 'pan.xunlei.com' && b.meta?.client_version === '1.93.6'; })(), JSON.stringify(mockHits[0]).slice(0, 300));
+
+const xlCached = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'post:/drive/v1/share/restore' }) });
+const xlCachedBody = await xlCached.json();
+check('同 action 二次请求命中缓存（不发上游）', xlCached.ok && xlCachedBody.cached === true && mockHits.length === 1, JSON.stringify(xlCachedBody));
+
+const xlOther = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'get:/drive/v1/files' }) });
+const xlOtherBody = await xlOther.json();
+check('不同 action 不共享缓存（重新 init）', xlOther.ok && xlOtherBody.cached === false && mockHits.length === 2, JSON.stringify(xlOtherBody));
+
+// ⑩.7 v1.4 迅雷账号相关 ops（/api/xunlei/op；全部打本地 mock，不动真上游）
+const xlOpNoToken = await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'download', fid: 's1' }) });
+check('xunlei op 无令牌 → 401', xlOpNoToken.status === 401, `status=${xlOpNoToken.status}`);
+const xlOpBad = await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'nope' }) });
+check('xunlei op 非法 op → 400', xlOpBad.status === 400, `status=${xlOpBad.status}`);
+const xlOpNoAcc = await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1' }) });
+const xlNoAccBody = await xlOpNoAcc.json();
+check('未配账号 → 明确 NO_ACCOUNT（中文指引，不静默）', xlOpNoAcc.status === 200 && xlNoAccBody.ok === false && xlNoAccBody.code === 'NO_ACCOUNT' && /README|后台/.test(xlNoAccBody.message ?? ''), JSON.stringify(xlNoAccBody));
+check('未配账号时不打上游（mock 无 /drive 命中）', !mockHits.some((h) => h.url.includes('/drive/')), JSON.stringify(mockHits.map((h) => h.url)));
+
+// 配置托管账号（authorization + to_parent_id）
+r = await fetch(`${base}/api/web/settings`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf }, body: JSON.stringify({ xunlei: { authorization: 'Bearer FAKE-AUTH', to_parent_id: 'parent-1', user_id: '42' } }) });
+check('迅雷托管账号设置写入', r.ok, `status=${r.status}`);
+const xlView = await (await fetch(`${base}/api/web/settings`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('settings 回 xunlei 托管账号（authorization 只回是否配置，不回明文）', xlView.xunlei?.authorizationSet === true && !JSON.stringify(xlView.xunlei).includes('FAKE-AUTH'), JSON.stringify(xlView.xunlei));
+
+const opSettings = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'settings' }) })).json();
+check('op settings → ok', opSettings.ok === true, JSON.stringify(opSettings));
+
+const opDl = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1' }) })).json();
+check('op download → 直链 + expiresAt（links[].expire ISO→ms）+ 脱敏详情', opDl.ok === true && /dl\/mock/.test(opDl.url ?? '') && opDl.expiresAt === Date.parse('2026-10-03T20:00:00+08:00') && opDl.detail?.links?.['application/pdf']?.hasUrl === true && Boolean(opDl.detail?.params?.device_id) && !/dev-mock/.test(JSON.stringify(opDl.detail)), JSON.stringify(opDl).slice(0, 260));
+
+const opZip = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 'zipped' }) })).json();
+check('压缩类无直链 → NEED_RENAME', opZip.ok === false && opZip.code === 'NEED_RENAME', JSON.stringify(opZip));
+
+const opRename = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'rename', fid: 'my1', name: 'a.zip' }) })).json();
+const patchHit = mockHits.find((h) => h.method === 'PATCH' && h.url.includes('/drive/v1/files/'));
+check('op rename → PATCH /drive/v1/files/{id} + 3 位补零随机后缀', opRename.ok === true && Boolean(patchHit) && /"name":"a\.zip\.\d{3}"/.test(patchHit.body), JSON.stringify({ opRename, body: patchHit?.body }));
+
+const opRestore = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'restore', share_id: 'S1', pass_code_token: 'st', fids: ['s1', 's2'] }) })).json();
+check('op restore → trace_file_ids 映射', opRestore.ok === true && opRestore.results?.length === 2 && opRestore.results[0].fileId === 'my1', JSON.stringify(opRestore));
+
+const bizHit = mockHits.filter((h) => h.url.includes('/drive/') && h.headers['x-captcha-token']).pop();
+check('上游业务请求带 backend 自己的 device/captcha/authorization', Boolean(bizHit) && bizHit.headers['x-device-id'] === fakeDevice && bizHit.headers['authorization'] === 'Bearer FAKE-AUTH' && Boolean(bizHit.headers['x-captcha-token']), JSON.stringify(bizHit && { dev: bizHit.headers['x-device-id'], auth: bizHit.headers['authorization'], act: bizHit.url }));
+
 // ⑪ 严格终端：未开启时 ws 应 403；开启后过滤高危命令
 r = await fetch(`${base}/api/web/settings`, {
   method: 'POST',
@@ -275,4 +377,5 @@ check('轮换后旧令牌 → 401（wrangler 需 restart 同步）', r.status ==
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 child.kill('SIGTERM');
+mockSrv.close();
 process.exit(fail > 0 ? 1 : 0);

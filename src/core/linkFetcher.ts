@@ -55,6 +55,8 @@ export async function fetchLinks(
         shareId: ctx.shareId,
         stoken: ctx.stoken,
         guestMode: ctx.guestMode, // v1.1.9.final：qk-guestTurn 游客模式透传
+        // v1.4 逐文件进度：原样透传（适配器可选实现；未实现则无任何回调，行为不变）
+        onProgress: options?.onProgress,
       });
       // 适配器返回与输入顺序一致（接口契约）；逐一回填，数量不足时补失败项
       for (let j = 0; j < batch.length; j++) {

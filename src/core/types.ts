@@ -161,6 +161,11 @@ export interface LinkFetchOptions {
   batchIntervalMs?: number;
   /** 失败时是否继续后续批次（默认 true） */
   continueOnError?: boolean;
+  /**
+   * v1.4 逐文件进度（可选；**只报不干预**）：原样透传给适配器 DownloadParams.onProgress，
+   * 供 UI 动态显示进度。批间节流/顺序/失败策略不受其影响。
+   */
+  onProgress?: (evt: import('../adapters/types').LinkProgressEvent) => void;
 }
 
 /* ============================== 偏好设置 ============================== */
@@ -174,6 +179,27 @@ export interface QuarkPrefs {
    * 副标题：配置本地管理面板后不生效（后端账号池会接管游客流转）。
    */
   qkGuestTurn: boolean;
+}
+
+/** 迅雷云盘专属偏好（v1.4） */
+export interface XunleiPrefs {
+  /**
+   * scan 单页条数（默认 30 = 官方 web 默认值）。调大能减少翻页次数，但每次都拉更多对象、
+   * 更容易触发风控；0/非法值回退 30。
+   */
+  scanLimit: number;
+  /**
+   * 单页装不下时是否按「大宗文件判定阈值」（`Preferences.bulkThreshold`）重跑一次首页（默认开）：
+   * 例如默认 30 只有 30 条 + next_page_token 时，改用 bulkThreshold（默认 100）再拉一次；
+   * 仍是游标就按页续拉。观：大目录少翻几页；关掉则严格逐页拉。
+   */
+  bulkRetry: boolean;
+  /**
+   * 解析后是否允许在文件行看「隐秘参数」（默认关；需先解析该文件）：
+   * 展示详情接口返回的 params.device_id / share_id / task_id、links 的 expire/token_type 等
+   * 脱敏字段，方便定位后端账号是不是会员号。**不含任何凭据本体**。
+   */
+  fileHiddenVolumn: boolean;
 }
 
 /** 弹窗开关（HANDOFF 附件 UAC 表底部全局行） */
@@ -325,6 +351,8 @@ export interface Preferences {
   advanced: AdvancedPrefs;
   /** 夸克网盘专属偏好（v1.1.9.final：qk-guestTurn 游客模拟开关） */
   quark: QuarkPrefs;
+  /** 迅雷云盘专属偏好（v1.4：scan 单页条数 / 大宗重跑 / 解析后隐秘参数） */
+  xunlei: XunleiPrefs;
   /**
    * 资源复用窗口（小时，v1.1.4）：0 = 不复用。
    * v1.2.x 复用分家：本偏好只决定 **scan（资源列表）快照** 复用 —— 窗口内从历史/足迹

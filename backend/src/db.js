@@ -140,6 +140,11 @@ export function initDb() {
   if (!columnExists('proxy_logs', 'resp_body')) {
     db.exec(`ALTER TABLE proxy_logs ADD COLUMN resp_body TEXT DEFAULT ''`);
   }
+  // v1.4 迅雷域 → pan 映射（host 只增不减：INSERT OR IGNORE）。
+  // 功能上 proxy.js#panOfHostname 已按后缀兜底 xunlei.com；落表是为了面板可见/终端可查。
+  for (const host of ['api-pan.xunlei.com', 'xluser-ssl.xunlei.com']) {
+    db.prepare('INSERT OR IGNORE INTO hosts (host, pan, created_at) VALUES (?,?,?)').run(host, 'xunlei', Date.now());
+  }
   return db;
 }
 
@@ -192,7 +197,7 @@ export function listHosts() {
 export function addHost(host, pan) {
   const h = String(host ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   if (!h || h.includes('..') || h.includes('/') || h.length > 253) throw new Error('host 不合法（只接受纯域名）');
-  if (!['quark', 'uc'].includes(pan)) throw new Error('pan 只支持 quark / uc');
+  if (!['quark', 'uc', 'xunlei'].includes(pan)) throw new Error('pan 只支持 quark / uc / xunlei');
   const info = getDb()
     .prepare('INSERT OR IGNORE INTO hosts (host, pan, created_at) VALUES (?,?,?)')
     .run(h, pan, Date.now());

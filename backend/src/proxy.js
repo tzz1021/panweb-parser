@@ -41,6 +41,10 @@ function classifyOperation(url) {
   if (/file\/download/.test(url)) return 'download'; // uc/quark
   if (/\/v2\/file\/get_download_url/.test(url)) return 'download'; // alipan
   if (/\/adrive\/v4\/batch/.test(url)) return 'restore'; // alipan 批量转存
+  // xunlei（v1.4）：restore 必须先判（/share/restore 会被 scan 的 /share 前缀吃穷）
+  if (/\/drive\/v1\/share\/restore/.test(url)) return 'restore'; // 迅雷转存
+  if (/\/drive\/v1\/share(\?|$)|\/drive\/v1\/share\/detail/.test(url)) return 'scan'; // 迅雷分享根 / 目录 detail
+  if (/\/drive\/v1\/files\//.test(url)) return 'download'; // 迅雷文件详情（取 web_content_link）
   return 'other';
 }
 
@@ -49,6 +53,7 @@ function panOfHostname(hostname) {
   const h = String(hostname ?? '').toLowerCase();
   if (h.endsWith('uc.cn')) return 'uc';
   if (h.endsWith('quark.cn')) return 'quark';
+  if (h.endsWith('xunlei.com')) return 'xunlei'; // v1.4：api-pan.xunlei.com / xluser-ssl.xunlei.com
   const mapped = findHost(h);
   return mapped ? mapped.pan : null;
 }

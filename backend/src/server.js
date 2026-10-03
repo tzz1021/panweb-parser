@@ -22,6 +22,14 @@ import { log, listLogs, clearRing } from './log.js';
 import { hostAllowed, originAllowed, verifyWebuiToken, createCsrf, verifyCsrf, verifyProxyToken } from './auth.js';
 import { handleProxy } from './proxy.js';
 import { getWranglerHealth } from './wrangler.js';
+import {
+  captchaTokenForAction,
+  clearXunleiTokenCache,
+  runOp,
+  xunleiSettingsView,
+  XunleiTokenConfigError,
+  XunleiTokenUpstreamError,
+} from './xunlei.js';
 import { listPresets, runPreset, browserHealth } from './presets.js';
 import {
   listAccounts, getAccount, upsertAccount, deleteAccount, countByPan, pickAccountForPan,
@@ -239,6 +247,106 @@ async function handleCredentialPickAccounts(req, res, clientIp) {
   const identities = listAccountIdentities(provider || null);
   const accounts = wanted ? identities.filter((x) => x === wanted) : identities;
   json(res, 200, { accounts, provider: provider || null }, { ...PROXY_CORS, 'cache-control': 'no-store' });
+}
+
+/**
+ * v1.4 迅雷 captcha_token 端点（X-Proxy-Token 鉴权）：
+ *   POST /api/xunlei/captcha-token  body { action, user_id? } → { captcha_token, expires_in, cached }
+ * 供 functions 的透明注入链路调用（SPA 不经手；预热路由 /api/xunlei-captcha 再透传到这里）。
+ * 硬约束：**绝不回传 sign / device_id**；未配置或上游失败一律明确 4xx/5xx + 中文 message。
+ */
+const XUNLEI_ACTION_RE = /^(get|post|put|delete):\/\S+$/i;
+
+async function handleXunleiCaptchaToken(req, res) {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, PROXY_CORS);
+    res.end();
+    return;
+  }
+  if (req.method !== 'POST') {
+    json(res, 404, { error: 'NOT_FOUND', message: '仅 POST /api/xunlei/captcha-token' }, PROXY_CORS);
+    return;
+  }
+  if (!verifyProxyToken(req.headers['x-proxy-token'] ?? '')) {
+    json(res, 401, { error: 'UNAUTHORIZED', message: 'X-Proxy-Token 无效' }, PROXY_CORS);
+    return;
+  }
+  let body = {};
+  try {
+    const raw = await readBody(req);
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    json(res, 400, { error: 'BAD_BODY', message: '请求体必须是 JSON（{ action }）' }, PROXY_CORS);
+    return;
+  }
+  const action = typeof body?.action === 'string' ? body.action.trim() : '';
+  if (!XUNLEI_ACTION_RE.test(action)) {
+    json(res, 400, { error: 'BAD_REQUEST', message: 'action 格式必须是 method:path（如 post:/drive/v1/share/restore）' }, PROXY_CORS);
+    return;
+  }
+  const userId = body?.user_id !== undefined && body?.user_id !== null && String(body.user_id) !== '' ? String(body.user_id) : undefined;
+  try {
+    const r = await captchaTokenForAction(action, { userId });
+    audit('xunlei.captcha-token', `${action} → ${r.cached ? 'cached' : 'fresh'}`, 'hop');
+    // 只回 token 本身；sign / device_id 永不出接口
+    json(res, 200, r, { ...PROXY_CORS, 'cache-control': 'no-store' });
+  } catch (err) {
+    if (err instanceof XunleiTokenConfigError) {
+      json(res, 400, { error: 'XUNLEI_NOT_CONFIGURED', message: err.message }, PROXY_CORS);
+      return;
+    }
+    if (err instanceof XunleiTokenUpstreamError) {
+      json(res, 502, { error: 'XUNLEI_UPSTREAM_FAILED', message: err.message }, PROXY_CORS);
+      return;
+    }
+    json(res, 500, { error: 'INTERNAL', message: err.message }, PROXY_CORS);
+  }
+}
+
+/* ================= v1.4 迅雷账号相关 ops（settings/restore/rename/download） ================= */
+
+/** op 词表（与 SPA XunleiOpName / functions 路由同表） */
+const XUNLEI_OPS = ['settings', 'restore', 'rename', 'download'];
+
+/**
+ * POST /api/xunlei/op（X-Proxy-Token 鉴权）—— 前端只发意图，backend 用自己的
+ * device/sign→captcha_token/authorization 代发上游请求；结果原样回前端。
+ */
+async function handleXunleiOp(req, res) {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, PROXY_CORS);
+    res.end();
+    return;
+  }
+  if (req.method !== 'POST') {
+    json(res, 404, { error: 'NOT_FOUND', message: '仅 POST /api/xunlei/op' }, PROXY_CORS);
+    return;
+  }
+  if (!verifyProxyToken(req.headers['x-proxy-token'] ?? '')) {
+    json(res, 401, { error: 'UNAUTHORIZED', message: 'X-Proxy-Token 无效' }, PROXY_CORS);
+    return;
+  }
+  let body = {};
+  try {
+    const raw = await readBody(req);
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    json(res, 400, { error: 'BAD_BODY', message: '请求体必须是 JSON' }, PROXY_CORS);
+    return;
+  }
+  const op = String(body?.op ?? '');
+  if (!XUNLEI_OPS.includes(op)) {
+    json(res, 400, { error: 'BAD_OP', message: `op 必须是 ${XUNLEI_OPS.join(' / ')}` }, PROXY_CORS);
+    return;
+  }
+  try {
+    const result = await runOp(op, body);
+    // 业务失败（ok:false）也回 200：让前端拿到结构化 code/message（不静默、不抛 HTTP 错误）
+    audit('xunlei.op', `${op}${result.ok ? ' ok' : ` → ${result.code ?? 'FAILED'}`}`, 'hop');
+    json(res, 200, result, { ...PROXY_CORS, 'cache-control': 'no-store' });
+  } catch (err) {
+    json(res, 500, { ok: false, error: 'INTERNAL', code: 'INTERNAL', message: err.message }, PROXY_CORS);
+  }
 }
 
 /* ================= webui API 路由 ================= */
@@ -587,6 +695,8 @@ async function handleWebApi(req, res, pathname, body) {
       // v1.3.1：临时写入默认 TTL（分钟；面板勾选「临时」时使用，可自行填写覆盖）+ trace 文件明细粒度
       accountTempTtlMinutes: Number(getSetting('account_temp_ttl_minutes') ?? 30),
       traceFileDetail: String(getSetting('trace_file_detail') ?? 'full'),
+      // v1.4 迅雷 restore/download：web 身份 captcha 设置（sign 只回脱敏视图）
+      xunlei: xunleiSettingsView(),
       // 只读说明：白名单/限频在 functions/api/proxy.js（单一实现），backend 不重复维护
       policy: { whitelist: 'functions/api/proxy.js → ALLOWED_HOST_SUFFIXES', rateLimit: 'proxy.js 内置 120/min/IP（v1.3.2 从 60 放宽）', owner: 'proxy.js' },
     });
@@ -625,6 +735,19 @@ async function handleWebApi(req, res, pathname, body) {
       setSetting('trace_file_detail', v);
       audit('settings.trace-detail', `trace 文件明细 → ${v}`, 'webui');
       log('info', `settings：trace 文件明细粒度 → ${v}`);
+    }
+    // v1.4 迅雷设置（手动录入 sign 长期复用；client/package/device 必须与 sign 配套）
+    if (b.xunlei !== undefined && typeof b.xunlei === 'object') {
+      const allowed = ['captcha_sign', 'captcha_timestamp', 'device_id', 'client_id', 'client_version', 'package_name', 'authorization', 'to_parent_id', 'user_id'];
+      let changedSign = false;
+      for (const k of allowed) {
+        if (b.xunlei[k] === undefined) continue;
+        setSetting(`xunlei_${k}`, String(b.xunlei[k]).trim());
+        if (k === 'captcha_sign' || k === 'captcha_timestamp' || k === 'device_id') changedSign = true;
+      }
+      if (changedSign) clearXunleiTokenCache(); // 滚动更新后旧 token 不再复用
+      audit('settings.xunlei', `迅雷 captcha 设置更新（sign ${changedSign ? '已变更' : '未变'}）`, 'webui');
+      log('info', `settings：迅雷 captcha 设置更新（sign ${changedSign ? '已变更' : '未变'}）`);
     }
     saveConfig();
     return send(200, { ok: true });
@@ -785,6 +908,14 @@ export async function startServers() {
       // 账号身份查询（只回非敏感身份；供 functions 的 /api/credential-pick 调用）
       if (pathname === '/api/credential-pick/accounts') {
         return await handleCredentialPickAccounts(req, res, clientIp);
+      }
+      // v1.4 迅雷 captcha_token（供 functions 透明注入 / SPA 预热）
+      if (pathname === '/api/xunlei/captcha-token') {
+        return await handleXunleiCaptchaToken(req, res);
+      }
+      // v1.4 迅雷账号相关 ops（settings/restore/rename/download；backend 代发）
+      if (pathname === '/api/xunlei/op') {
+        return await handleXunleiOp(req, res);
       }
       // webui API
       if (pathname.startsWith('/api/web/')) {

@@ -42,6 +42,10 @@ export function classifyOperation(url: string): 'scan' | 'download' | 'restore' 
   if (/file\/download/.test(url)) return 'download'; // uc/quark
   if (/\/v2\/file\/get_download_url/.test(url)) return 'download'; // alipan
   if (/\/adrive\/v4\/batch/.test(url)) return 'restore'; // alipan 批量转存
+  // xunlei（v1.4）：restore 必须先判（/share/restore 会被 scan 的 /share 前缀吃穷）
+  if (/\/drive\/v1\/share\/restore/.test(url)) return 'restore'; // 迅雷转存
+  if (/\/drive\/v1\/share(\?|$)|\/drive\/v1\/share\/detail/.test(url)) return 'scan'; // 迅雷分享根 / 目录 detail
+  if (/\/drive\/v1\/files\//.test(url)) return 'download'; // 迅雷文件详情（取 web_content_link）
   return 'other';
 }
 
@@ -88,6 +92,64 @@ export type CredentialState = 'hit' | 'guest' | 'none';
  */
 export const CREDENTIAL_PICK_PATH = '/api/credential-pick';
 
+/* ===================== v1.4 迅雷账号相关 ops（由 backend 执行） ===================== */
+
+/**
+ * 迅雷 ops 端点 = **functions 自有路由**（不是 hop 转发路由）。
+ * 形态：`POST {proxyBase}{XUNLEI_OP_PATH}`，body `{ op, ... }`（X-Proxy-Token 鉴权）
+ *   → `{ ok, results?, url?, expiresAt?, error?, code? }`（functions 透传 backend，原样回前端）。
+ *
+ * 语义（Tzz 2026-10-03 定稿）：settings/restore/rename/download 属**账号相关**操作，
+ * **不能由前端带凭据/头去发** —— 前端只发「请求意图」，backend 用自己的
+ * device_id / captcha_sign→captcha_token / authorization 完成上游请求。
+ * scan（share / share/detail）仍由 SPA 本地发（本地 device_id + 自造 captcha）。
+ * 直连（无代理）没有该能力 → 调用方按「需要代理托管」明确失败（不静默）。
+ */
+export const XUNLEI_OP_PATH = '/api/xunlei/op';
+
+/** ops 名（与 backend `runOp` 同一词表） */
+export type XunleiOpName = 'settings' | 'restore' | 'rename' | 'download';
+
+/** 发给 /api/xunlei/op 的请求体（前端只发意图，不带凭据/头） */
+export interface XunleiOpPayload {
+  op: XunleiOpName;
+  share_id?: string;
+  pass_code_token?: string;
+  to_parent_id?: string;
+  /** restore 批量 */
+  fids?: string[];
+  /** rename / download 单文件 */
+  fid?: string;
+  /** rename 的原始文件名（backend 追加 3 位补零随机数伪装分卷） */
+  name?: string;
+}
+
+/** ops 结果（backend 形状：{ ok, results?, url?, expiresAt?, error?, code? }） */
+export interface XunleiOpResult {
+  /** HTTP 状态（网络层；0 = 未发出/不可达） */
+  status: number;
+  /** 端点可达且返回合法 JSON（HTTP 2xx） */
+  ok: boolean;
+  data: {
+    ok?: boolean;
+    /** restore 映射：分享 file id → 我盘 file id */
+    results?: Array<{ fid: string; fileId: string }>;
+    url?: string;
+    expiresAt?: number;
+    /** 文件大小（backend 从详情读到的；缺省用分享值） */
+    size?: number | string;
+    /**
+     * 脱敏文件详情（backend 构造；下载直链时带回供「隐秘参数」就地查看）。
+     * 仅含字段名 + 安全值（token 类型/过期、URL 存在性），**永不含** token/凭据明文。
+     */
+    detail?: unknown;
+    error?: string;
+    /** 结构化错误码（如 NO_ACCOUNT / NOT_FOUND / NEED_RENAME） */
+    code?: string;
+    message?: string;
+  } | null;
+}
+
 /** 凭据探测结果：ok=false 时 reason 说明为何拿不到状态（调用方安全降级，不视作致命错误） */
 export type CredentialProbeResult =
   | { ok: true; credential: CredentialState }
@@ -109,6 +171,12 @@ export interface Transport {
    * @param account  账号身份（非敏感；命中判定用，可省）
    */
   credentialProbe?(provider: string, account?: string): Promise<CredentialProbeResult>;
+  /**
+   * v1.4 迅雷账号相关 ops（settings/restore/rename/download）——
+   * 只有代理类传输提供（functions 转 backend 执行）；直连 = undefined = 不可用
+   * （调用方转「需代理托管」明确错误，不静默）。
+   */
+  xunleiOp?(payload: XunleiOpPayload): Promise<XunleiOpResult>;
 }
 
 /** 直连实现：浏览器 fetch（现状逻辑搬移，错误结构化） */
@@ -229,6 +297,40 @@ export class ProxyTransport implements Transport {
     const state = data?.credential;
     if (state !== 'hit' && state !== 'guest' && state !== 'none') return { ok: false, reason: 'unreachable' };
     return { ok: true, credential: state };
+  }
+
+  /**
+   * v1.4 迅雷 ops：把「请求意图」POST 给 functions（再转 backend 代发）。
+   * 只负责传输与 JSON 解析；业务失败（ok:false / 非 2xx）原样返回，由适配器转中文。
+   */
+  async xunleiOp(payload: XunleiOpPayload): Promise<XunleiOpResult> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.base}${XUNLEI_OP_PATH}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.token ? { 'X-Proxy-Token': this.token } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      return {
+        status: 0,
+        ok: false,
+        data: {
+          error: 'PROXY_UNREACHABLE',
+          message: `代理请求失败：${err instanceof Error ? err.message : String(err)}（请检查代理地址或网络）`,
+        },
+      };
+    }
+    let data: XunleiOpResult['data'] = null;
+    try {
+      data = (await res.json()) as XunleiOpResult['data'];
+    } catch {
+      data = null;
+    }
+    return { status: res.status, ok: res.ok, data };
   }
 
   async request(req: TransportRequest): Promise<TransportResponse> {

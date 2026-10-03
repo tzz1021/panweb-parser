@@ -28,6 +28,8 @@ export const CREDENTIAL_KEYS = ['__pus', '__puus', '__pugs', '__uid', 'sdid', 'u
 export const PAN_KEYS = {
   quark: ['__pus', '__uid', '__puus'],
   uc: ['__pugs'],
+  // v1.4：迅雷不是 cookie 而是「授权头 + 转存目标目录」；面板录号走同一张表（键名同凭据串）
+  xunlei: ['authorization', 'to_parent_id', 'user_id'],
 };
 
 /** guest 账号只认 __pugs（游客态下载凭据，quark 小文件/UC 同机制） */

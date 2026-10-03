@@ -8,6 +8,41 @@
 
 ---
 
+## 2026-10-02 迅雷 captcha_sign：盐表与身份必须配套，混搭必败
+
+【现象】用 webapp 抓包里的 12 条盐 + `client_version 1.93.6` 复现不出抓包里的 `captcha_sign`（拿两组真机样本反推 1280 种变体全不中，从拼串顺序到盐序/大小写/版本都试遍）；
+把「web 的 client_id + alist 的盐表」混搭去 `captcha/init`，服务端回 `invalid_argument / invalid captcha_sign`。
+【根因】`captcha_sign = 多轮 md5( client_id + client_version + package_name + device_id + timestamp + 盐…)`，
+**盐表是随「客户端身份三件套」配套下发的**：换 client_id/version/package 之一，盐表也必须换。
+webapp 的算法被高度混淆且随版本更新（linkswift 里写死的盐表早已失效，它今天还能跑只是因为脚本从 localStorage 复用旧的 captcha_sign）。
+alist 的 android 身份（`Xp6vsxz_7IYVw2BB` / `8.31.0.9726` / `com.xunlei.downloadprovider` + 它自己的 10 盐）**一次通过**。
+【修法/规避】`src/adapters/xunlei/types.ts` 把身份三件套 + 盐表**同一处声明**（借 alist 在野身份，Tzz 已认可），
+device_id 随机生成后持久化，**不要**用真实/浏览器用过的 device id；
+`captcha/init` 失败先怀疑三者是否配套，别去调拼串顺序。
+【教训】逆向签名时先用**两组真机样本**双向校验（只对一组可能碰巧）；
+「算法对但签不过」通常是**输入配套**问题，不是算法问题。
+
+## 2026-10-02 迅雷 share/detail 默认 limit=30 会把大宗目录截断
+
+【现象】大宗分享（36 个一级对象）用 `limit=30` 拉 detail，只回 30 条且 `next_page_token` 非空；
+照旧按「30 条 = 一屏」处理会**静默少 6 条**（与遍历层静默丢数据同类后果）。
+【根因】迅雷是游标分页（`page_token`/`next_page_token`），单页上限受 `limit` 控制；`limit=50` 实测可一次拿满 36 条。
+【修法/规避】scan 策略：**默认 30 跑一次 → `next_page_token` 非空则改 `limit=50` 重跑**；
+仍非空才用 `page_token` 继续翻（此时对象数已超 bulk 阈值 100，正好一并覆盖）。
+一级对象数可直接取 `file_num`（分享根）/ `parent.params.file_property_count`（子目录），不必数数组。
+【教训】接游标制网盘先做一次「同目录不同 limit」的对照实测，别沿用页码制网盘的经验值。
+
+## 2026-10-02 迅雷 `pass_code_token` 不能绕过转存
+
+【现象】想用分享 `pass_code_token` 直接取分享文件直链，避免转存：
+`GET /drive/v1/files/{分享内 id}`（不带 Authorization）→ 401 `unauthenticated`；
+`?space=`/`?with_audit=true` 同样 401；自造的分享域端点（`/share/files/{id}`、`/share/file/{id}`）→ 404 `not_found`。
+【根因】`/drive/v1/files/{id}` 只认「调用者自己盘里」的文件，直链 `web_content_link` 是在**你的账号上下文**里生成的；
+分享里的文件属于分享者，必须先 `POST /drive/v1/share/restore` 转存进自己盘（`trace_file_ids` 给新 id）才能取直链。
+【修法/规避】适配器固定两段：scan（游客 + captcha）与 restore+download（登录态）；
+转存要带 `settings{item:restore_path}` 先设落地目录，且**迅雷不允许接收者是分享者**（用分享响应的 `user_info.user_id` 提前拦）。
+【教训】「分享态能读目录」≠「能取直链」；判断某网盘能否免转存，看取直链端点是否要求登录态上下文，而不是看 list 接口。
+
 ## 2026-09-11 阿里云盘直链「刚解析就显示过期」
 
 【现象】prase 成功、直链实际能下，但 UI 立刻标「已过期」。

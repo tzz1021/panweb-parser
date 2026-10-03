@@ -42,6 +42,12 @@ export interface DirectoryTreeProps {
   onHiddenVolumn?: (node: TreeNode) => void;
   /** v1.1.7 高级功能：显示隐秘参数按钮 */
   showHiddenVolumn?: boolean;
+  /**
+   * v1.4：**文件行**的隐秘参数按钮（解析后可就地看脱敏详情，不发请求）；
+   * 两个 props 都给才渲染（父级已按设置 + 适配器能力门开）
+   */
+  showFileHiddenVolumn?: boolean;
+  onFileHiddenVolumn?: (fid: string) => void;
   /** v1.1.7 显示 etag（最右列“校验和”，离线从数据库读取） */
   showEtag?: boolean;
   /** v1.1.7 显示详细的解析时间和有效期（上次HH:MM剩xHxM） */
@@ -62,6 +68,8 @@ export function DirectoryTree({
   dirProps,
   onHiddenVolumn,
   showHiddenVolumn,
+  showFileHiddenVolumn,
+  onFileHiddenVolumn,
   showEtag,
   showLinkDetail,
 }: DirectoryTreeProps): JSX.Element {
@@ -159,6 +167,18 @@ export function DirectoryTree({
                 <td className="col-num">{formatTime(f.modifiedAt)}</td>
                 <td className="col-action">
                   {/* v1.1.5.3：移除每行 status:xxx 文本（保留四色行底色 + 状态按钮） */}
+                  {/* v1.4：文件行隐秘参数（迅雷）——解析后可就地看脱敏详情，不发请求 */}
+                  {!isDir && showFileHiddenVolumn && onFileHiddenVolumn && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      style={{ padding: '1px 6px', fontFamily: 'monospace', fontSize: 12, marginRight: 6 }}
+                      onClick={() => onFileHiddenVolumn(f.fid)}
+                      title="隐秘参数（仅限开发者）：查看该文件最近一次解析的脱敏详情字段（不发请求）"
+                    >
+                      {'<>'}
+                    </button>
+                  )}
                   {/* v1.1.7：设置开启时显示详细状态文本（上次HH:MM剩xHxM） */}
                   {!isDir && showLinkDetail && link && (
                     <span className="field-hint" style={{ color: statusColor, marginRight: 6 }}>

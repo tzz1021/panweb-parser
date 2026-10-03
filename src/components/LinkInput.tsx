@@ -12,14 +12,32 @@ import { detectShareUrl } from '../adapters/registry';
 import { listLinks } from '../core/footprint/links';
 import { useToast } from './Toast';
 
-/** 从分享文案中提取 URL 与提取码 */
+/** 从分享文案中提取 URL 与提取码（两者都可缺） */
 export function extractShare(text: string): { url: string; passcode?: string } {
   const urlMatch = text.match(/https?:\/\/[^\s"'<>，。；、]+/);
   const url = urlMatch ? urlMatch[0] : text.trim();
   const pc =
+    // v1.4：链接里的 pwd=xxx（迅雷/夸克等都通用）优先于文案里的「提取码：」
+    url.match(/[?&]pwd=([A-Za-z0-9]{4,8})/i)?.[1] ??
     text.match(/提取码[：:]\s*([A-Za-z0-9]{4,8})/)?.[1] ??
     text.match(/密码[：:]\s*([A-Za-z0-9]{4,8})/)?.[1];
   return { url, passcode: pc };
+}
+
+/**
+ * 把提取码写回 URL（两框简易同步用）：有 `pwd=` 就替换，无则追加；空码则删掉该参数。
+ * 不改变其它参数顺序与编码。
+ */
+export function withPasscodeInUrl(url: string, passcode: string): string {
+  const raw = (url ?? '').trim();
+  if (!raw) return raw;
+  const code = (passcode ?? '').trim();
+  const hasPwd = /[?&]pwd=/i.test(raw);
+  if (!code) {
+    return hasPwd ? raw.replace(/([?&])pwd=[^&#]*/i, '$1').replace(/[?&]$/, '').replace(/\?&/, '?') : raw;
+  }
+  if (hasPwd) return raw.replace(/([?&])pwd=[^&#]*/i, `$1pwd=${code}`);
+  return raw.includes('?') ? `${raw}&pwd=${code}` : `${raw}?pwd=${code}`;
 }
 
 export interface LinkInputProps {
@@ -78,11 +96,12 @@ export function LinkInput({
     void listLinks(100).then((links) => setHistory(links.map((l) => l.url)));
   }, []);
 
-  /** 输入/粘贴统一处理：提取 → 识别 → 高亮 */
+  /** 输入/粘贴统一处理：提取 → 识别 → 高亮（v1.4：URL 里的 pwd 同步到右侧提取码框） */
   const handleChange = (raw: string): void => {
     const { url: extracted, passcode: pc } = extractShare(raw);
     setUrl(extracted);
-    if (pc && !passcode) {
+    // v1.4 两框同步：URL 带 pwd 时以 URL 为准（空码不覆盖手填值）；文案里的「提取码：」仅在未填时补
+    if (pc && pc !== passcode) {
       setPasscode(pc);
       onPasscode?.(pc);
     }
@@ -100,6 +119,18 @@ export function LinkInput({
     } else {
       setDetectMsg({ ok: false, text: detectFailText });
       onDetect(null, extracted);
+    }
+  };
+
+  /** v1.4 两框同步：改提取码 → 写回左侧 URL 的 pwd= 参数（所有驱动通用；字段始终保留） */
+  const handlePasscodeChange = (value: string): void => {
+    setPasscode(value);
+    onPasscode?.(value);
+    const next = withPasscodeInUrl(url, value);
+    if (next !== url) {
+      setUrl(next);
+      prevUrl.current = next;
+      onDetect(detectShareUrl(next) ?? null, next);
     }
   };
 
@@ -134,12 +165,9 @@ export function LinkInput({
           </datalist>
           <input
             className="input input-passcode"
-            placeholder="提取码（可选）"
+            placeholder="提取码（可选；与链接里的 pwd= 双向同步）"
             value={passcode}
-            onChange={(e) => {
-              setPasscode(e.target.value);
-              onPasscode?.(e.target.value);
-            }}
+            onChange={(e) => handlePasscodeChange(e.target.value)}
             disabled={busy}
           />
           <button type="button" className="btn btn-primary" onClick={submit} disabled={busy}>

@@ -309,7 +309,15 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
         addGlobalLog(`scanner：jumper 未命中缓存 stoken，调用 token 接口获取`);
         ({ stoken } = await adapter.getToken({ shareId, passcode: pc }));
       }
-      const rootFile: ShareFile = { fid: folder.fid, fileName: folder.name, dir: true, size: 0 };
+      // v1.3.3 深链没有 fid：按名字链逐层下钻解析出目标文件夹 fid（找不到 → 明确报错，不回退到根）
+      let targetFid = folder.fid;
+      if (!targetFid && adapter.resolveJumpPath) {
+        addGlobalLog(`jumper：深链未带 fid，按名字逐层解析（${segments.map((s) => s.name).join(' / ')}）…`);
+        const resolved = await adapter.resolveJumpPath({ shareId, stoken, path: segments.map((s) => s.name) });
+        targetFid = resolved.fid;
+        addGlobalLog(`jumper：已解析到目标文件夹 fid=${resolved.fid}（${resolved.name}）`);
+      }
+      const rootFile: ShareFile = { fid: targetFid, fileName: folder.name, dir: true, size: 0 };
       const snap = await fetchListSnapshot(adapter, shareId, shareUrl, {
         passcode: pc,
         stoken, // 预置 stoken，跳过 token 接口（jumper 复用缓存）

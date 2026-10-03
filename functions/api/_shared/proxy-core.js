@@ -49,6 +49,7 @@ const ALLOWED_HOST_SUFFIXES = [
   'quark.cn', // 夸克网盘（v1.1.9：token/detail/download 全在 drive-h.quark.cn；大文件需登录 cookie）
   'aliyundrive.com', // 阿里云盘（v1.2.x alipan：scan/prase 全在 api.aliyundrive.com）
   'alipan.com', // 阿里云盘别名域（api.alipan.com 同构；旧域 www.aliyundrive.com 入口也在 alipan 主域下）
+  'xunlei.com', // 迅雷云盘（v1.4 xunlei：api-pan.xunlei.com 走分享/转存/详情，xluser-ssl.xunlei.com 走 captcha/init）
 ];
 
 const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'DELETE'];
@@ -155,6 +156,9 @@ function forwardHeaders(headers) {
     'x-share-token',
     'x-canary',
     'x-device-id',
+    // v1.4 迅雷：scan 的本地自造 token / 代理层注入的 token 都必须能到达上游
+    'x-captcha-token',
+    'x-client-id',
   ]) {
     const v = lower[name];
     if (typeof v === 'string' && v) out[name] = v;
@@ -178,6 +182,10 @@ export function classifyOperation(url) {
   if (/\/v2\/file\/get_download_url/.test(url)) return 'download'; // alipan
   // restore：转存（旧称 copy）
   if (/\/adrive\/v4\/batch/.test(url)) return 'restore'; // alipan 批量转存（内层 url:/file/copy）
+  // xunlei（v1.4）：restore 必须先判（/share/restore 会被 scan 的 /share 前缀吃穷）
+  if (/\/drive\/v1\/share\/restore/.test(url)) return 'restore'; // 迅雷转存
+  if (/\/drive\/v1\/share(\?|$)|\/drive\/v1\/share\/detail/.test(url)) return 'scan'; // 迅雷分享根 / 目录 detail
+  if (/\/drive\/v1\/files\//.test(url)) return 'download'; // 迅雷文件详情（取 web_content_link）
   return 'other';
 }
 
@@ -187,8 +195,16 @@ function panOfHostname(hostname) {
   if (h.endsWith('uc.cn')) return 'uc';
   if (h.endsWith('quark.cn')) return 'quark';
   if (h.endsWith('aliyundrive.com') || h.endsWith('alipan.com')) return 'alipan';
+  if (h.endsWith('xunlei.com')) return 'xunlei'; // v1.4：api-pan / xluser-ssl 都在 xunlei.com
   return null;
 }
+
+/* ============ v1.4 架构说明：迅雷账号相关请求不再走本转发链路 ============
+ * settings / restore / rename / download 属账号相关操作，由 backend 用自己的
+ * device_id / captcha_token / authorization 代发（functions/api/xunlei-op.js → backend runOp）。
+ * SPA 只发 ops 意图；本链路仅服务 scan（SPA 本地自造 captcha）与其他网盘。
+ * 不要用后端 device/captcha 替换前端请求 —— captcha 绑定 device_id，冒用会把后端设备甚至账号标记（Tzz 2026-10-03）。
+ */
 
 /** BACKEND_URL 可用性缓存（模块级；成功/失败都缓存 5s，避免每请求探测宕机后端） */
 let backendAvail = { ok: true, at: 0 };
@@ -489,6 +505,9 @@ export async function handleProxyRequest(context, kind = null) {
       classified: operation,
     });
   }
+
+  // v1.4 架构纠正（Tzz 2026-10-03）：不再向 SPA 的 restore/download 请求自动注入 x-captcha-token。
+  // 账号相关操作改由 backend 代发（functions/api/xunlei-op.js → backend runOp）。
 
   // v1.2.2 云端取号（仅 env.BACKEND_URL 存在 + uc/quark + operation==='download'（旧名 prase）；
   // scan 保持游客，与本地 hop 语义一致）：

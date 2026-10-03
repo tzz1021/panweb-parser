@@ -3,6 +3,62 @@
 > 面向开发者（repo:/dev/ 入口）。面向用户的说明见 README.md。
 > 约定：`## [版本] 日期` + 三块（新增 / 修复 / 变更）。
 
+## [1.4] 2026-10-03 —— 迅雷云盘适配器（第四个驱动）
+
+> 逆向依据与全部真机证据见 `docs/reverse-notes-xunlei.md`；
+> 同号分享策略见 `docs/todo-xunlei-same-account-restore.md`。
+> 未验证：同号链路 rename / 7z·rar 的 rename 已按实测结论写入文档；restore→直链仍未经真实登录态联调。
+
+### 新增
+- **迅雷云盘（xunlei）适配器**：`src/adapters/xunlei/`（`types` / `selector` / `captcha` / `scanner` / `download` / `auth` / `registry`）。
+  - **scan（游客可跑）**：`GET /drive/v1/share`（拿 `pass_code_token` 作 stoken）→ `GET /drive/v1/share/detail`（游标分页：`page_token` ↔ `next_page_token`）。
+    一级对象数**只对分享根可信**（`file_num`）；子目录**不提供** `total`（上游不回该值，退回 core 慢通道自行计数）。
+  - **captcha（每类请求都要）**：`captcha_sign = "1." + md5 链（身份三件套 + device_id + timestamp，逐盐 md5）`；
+    `POST xluser-ssl.xunlei.com/v1/shield/captcha/init` 领 300s token；缓存 `{action, token, deviceId, expiresAt}`，**剩余 >60s 才复用**；
+    `device_id` 随机 32hex 持久化（`pan-web:xunlei-device:v1`）。身份三件套 + 10 条盐集中在 `types.ts`
+    （借 alist 在野身份；web 端盐表已失效/高度混淆，Tzz 拍板「顶多封掉 alist」）。
+  - **restore + download（需登录态）**：`POST /drive/v1/settings {restore_path}` → `POST /drive/v1/share/restore`（批量，返回 `trace_file_ids` 映射）
+    → `GET /drive/v1/files/{我盘新 id}?space=&usage=CONSUME`；直链优先级 **`links[<mime>].url` → `web_content_link` → `medias[].link.url`**，
+    `expiresAt` 优先 `links[].expire`（ISO）回退 URL 的 `e=` 秒；`token_type: TOKEN_TYPE_ACCELERATION` 忽略（免费号无用）。
+    带本地 carry-over 复用（`pan-web:xunlei-carry:v1`，TTL 12h，命中即跳过 settings+restore 直接取直链）。
+  - **下载头为空**（`XL_DOWNLOAD_HEADERS = {}`）：真机 Range 探针证实**裸请求也 206**（无防盗链/UA 校验）；
+    直链**不带文件名**（无 content-disposition）→ 导出必须靠我们自己的路径名。
+  - **captcha 分工**：scan 由 SPA 本地自造（alist 身份）；**restore/download 的 `x-captcha-token` 由后端注入**
+    （web 身份 sign 前端算不出），适配器对应 `captcha: 'injected'` 模式（不本地 init、不带该头）。
+  - **登录态存放**：与 quark/alipan 一致**存 localStorage**（`pan-web:xunlei-auth:v1`）：
+    `authorization`（Bearer，容错裸 token）+ `to_parent_id`（转存目标目录 fid）+ `captcha_sign`（可选，应急自备）+ `user_id`；
+    **按字段合并写入**（粘贴只带 token 不会冲掉转存目录），读取兼容 sessionStorage 旧数据。
+  - `hash` **不采用**（分享态那个 40 位值是内部标识，详情接口的 `hash` 与直链 `g=` 参数同值、**啥也不是**），`ShareFile.md5` 不填。
+- **UAC 表补迅雷行**（`XL_LIMITS`）：转存 ✓ / 登录 ✓ / 能否提速 ✗（未实测按不误导）/ scan「单页条数按设置（默认 30）」/
+  restore「不允许接收者是分享者」/ 其他续期「Alist(SDK) 反代，会与手机 app 互踢」/ 直链有效期「6h（e= / links[].expire）」/
+  download_url 额外说明「无需任何请求头（实测裸 Range 206）；直链不带文件名」/ 登录凭据「auth(JWT) 1d」；
+  `PanTable` 里迅雷 `available: true`，`adapters/registry.ts` 注册。
+- **迅雷专属设置区**（`components/settings/XunleiSettings.tsx` + `Preferences.xunlei`）：
+  「scan 单页条数」（默认 **30**，官方同值）、「单页不够时按大宗阈值重跑」（默认开；重跑条数取 `bulkThreshold`，
+  **不是写死的 50**）、「解析后显示文件隐秘参数」（默认关）。
+- **文件级「隐秘参数」**（新能力 `PanAdapter.fileHiddenVolumn`）：解析后可就地查看该文件的**脱敏**详情字段
+  （device_id / share_id / task_id、links 的 expire / token_type 等），**不发请求、不开外链**，用于判断后端账号是不是会员号。
+- **代理/后端接线**：`functions` 白名单加 `xunlei.com`；三处 `classifyOperation`（SPA/functions/backend）同表加迅雷规则；
+  backend `panOfHostname` 映射 `xunlei`；新增 `backend/src/xunlei.js`（读设置里的 `xunlei_captcha_sign/_timestamp/_device_id`，
+  按 action 缓存 captcha_token、**剩余 >60s 复用**）+ `POST /api/xunlei/captcha-token`（X-Proxy-Token 鉴权，**不回传 sign/device_id**）+ 
+  `functions/api/xunlei-captcha.js`（薄透传，预热/排障用；未配 BACKEND_URL → 501、不可达 → 502）；
+  proxy-core 转发 restore/download 时**自动注入** `x-captcha-token`（payload 里已带则不覆盖）。
+- **深链识别**：`https://pan.xunlei.com/s/<id>?pwd=&path=<URL 编码路径>` 可直接识别取分享 ID，
+  新增 `parseSharePath()` 解出名字段（真正 jumper 需「按名字逐层下钻取 fid」，见 docs TODO）。
+
+### 修复
+- **迅雷全程 403 / 「验证码服务 HTTP 403」的根因 = 自家代理白名单没放行迅雷域**：
+  `functions` 的 `ALLOWED_HOST_SUFFIXES` 只有 uc/quark/aliyun，captcha 与分享请求在**我们代理层**就被 403 拦掉。
+  已加 `xunlei.com`（覆盖 `api-pan` / `xluser-ssl` / `pan` 三个域），并在三处分类词表同步迅雷规则。
+- （自测中发现并改正的错误假设）`parent.params.file_property_count` **不存在** ——「子目录一级对象数」上游并不返回，
+  适配器不再尝试用它填 `ListResult.total`（同名字段只出现在「父目录列出的子对象」上，语义未证实）。
+
+### 变更
+- 代理层三处分类词表（SPA `core/transport/types.ts` / `functions/_shared/proxy-core.js` / `backend/src/proxy.js`）加迅雷规则：
+  `/drive/v1/share/restore` → restore（**必须先于 scan 判定**，否则被 `/share` 前缀吃掉）、`/drive/v1/share` 与 `/share/detail` → scan、
+  `/drive/v1/files/` → download。冒烟脚本同步加断言（xunlei 域放行 + 分类四项 + 注入头）。
+- backend 冒烟扩到 56 项（新增 xunlei captcha 端点的鉴权/未配置/形状断言，全部走本地 mock，不打真上游）。
+
 ## [1.3.2] 2026-09-23 —— 扫描完整性 + 大宗目录过滤（bug 修复）
 
 
@@ -80,7 +136,7 @@
 - 前端说明文案精简：CookieInputModal 的两段托管提示合并进蓝色 inline 提示块；
   SPA 内不再出现「hop / 后端取号」这类内部术语（链路细节归 functions）。
 
-### 已知问题（已定位，**已在 [未发布] 2026-09-23 修复**）
+### 已知问题（已定位，**已在 1.3.2（2026-09-23）修复**）
 - **扫描失败被静默记 0**：`treeWalker` 的 catch 把失败目录 `size=0 / children=undefined`，
   失败目录不递归 → 调用数与进度条同步变小 → **结果不完整却看起来完整**。
   实测（同一条 UC 分享）：直连 223 次调用 = 4.18 GiB；经 CF Functions 60/min 限频 →

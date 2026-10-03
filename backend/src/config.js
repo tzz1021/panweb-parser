@@ -54,6 +54,17 @@ const DEFAULTS = {
   refresh: {
     intervalMs: 2 * 3600_000, // 正式账号 cookie 刷新周期（默认 2h；v1.2.2 §9 P2，quark 优先）
   },
+  // v1.4 迅雷 restore/download：web 身份 captcha（手动录入 sign，长期复用；见 src/xunlei.js）
+  xunlei: {
+    // 手动录入项（面板可改；此处预置仅在 settings 表为空时生效）
+    captcha_sign: '',
+    captcha_timestamp: '',
+    device_id: '',
+    // web 身份默认（必须与录入 sign 配套；一般不用改）
+    client_id: 'Xqp0kJBXWhwaTpB6',
+    client_version: '1.93.6',
+    package_name: 'pan.xunlei.com',
+  },
 };
 
 /** 当前配置（内存态；写回 config.json） */
@@ -93,6 +104,7 @@ export function loadConfig() {
         notify: { ...DEFAULTS.notify, ...(raw.notify ?? {}) },
         advanced: { ...DEFAULTS.advanced, ...(raw.advanced ?? {}) },
         refresh: { ...DEFAULTS.refresh, ...(raw.refresh ?? {}) },
+        xunlei: { ...DEFAULTS.xunlei, ...(raw.xunlei ?? {}) },
       };
     } catch (err) {
       console.error(`[config] config.json 损坏（${err.message}），使用默认值并备份`);

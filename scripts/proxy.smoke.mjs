@@ -98,5 +98,77 @@ assert('OPTIONS -> 204 + CORS', pre.status === 204 && pre.headers.get('access-co
 r = await onRequestPost({ request: new Request('https://example.com/api/proxy', { method: 'POST', headers: { 'x-proxy-token': 'x', 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://pc-api.uc.cn/x' }) }), env: {} });
 assert('env 缺 PROXY_TOKEN -> 503', r.status === 503, `got ${r.status}`);
 
+// 12. v1.4 迅雷：分类词表（与 backend/SPA 同表，防漂移）
+const core = await import('../functions/api/_shared/proxy-core.js');
+assert('分类 share 根 -> scan', core.classifyOperation('https://api-pan.xunlei.com/drive/v1/share?share_id=x') === 'scan');
+assert('分类 share/detail -> scan', core.classifyOperation('https://api-pan.xunlei.com/drive/v1/share/detail?share_id=x') === 'scan');
+assert('分类 share/restore -> restore（不被 scan 前缀吃）', core.classifyOperation('https://api-pan.xunlei.com/drive/v1/share/restore') === 'restore');
+assert('分类 files/<id> -> download', core.classifyOperation('https://api-pan.xunlei.com/drive/v1/files/abc?space=&usage=CONSUME') === 'download');
+assert('分类 captcha/init -> other', core.classifyOperation('https://xluser-ssl.xunlei.com/v1/shield/captcha/init') === 'other');
+assert('proxy-core 不再导出 xunleiActionOf（透明注入已废弃）', core.xunleiActionOf === undefined);
+
+// 13. 迅雷 scan 转发：白名单放行 + captcha 头透传（scan 仍由 SPA 本地发、走转发链路）
+globalThis.fetch = async (url, init) => {
+  assert('xunlei scan 转发目标正确', String(url).startsWith('https://api-pan.xunlei.com/drive/v1/share'), String(url));
+  assert('x-captcha-token 透传上游（scan 本地自造）', init.headers['x-captcha-token'] === 'local-scan-tok', JSON.stringify(init.headers));
+  assert('x-client-id 透传上游', init.headers['x-client-id'] === 'Xp6', JSON.stringify(init.headers));
+  assert('白名单外头仍被丢弃', !('x-evil' in init.headers));
+  return new Response('{"share_status":"OK"}', { status: 200, headers: { 'content-type': 'application/json' } });
+};
+r = await call({
+  url: 'https://api-pan.xunlei.com/drive/v1/share?share_id=x',
+  method: 'GET',
+  headers: { 'x-captcha-token': 'local-scan-tok', 'x-client-id': 'Xp6', 'x-evil': '1' },
+});
+assert('xunlei 域放行（不再 403）', r.status === 200, `got ${r.status}`);
+globalThis.fetch = realFetch;
+
+// 14. 转发链路**不再**自动注入 captcha：restore 请求原样转发（不塞 x-captcha-token）
+let fwdHeaders = null;
+globalThis.fetch = async (url, init) => {
+  fwdHeaders = init.headers;
+  return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+};
+r = await call({ url: 'https://api-pan.xunlei.com/drive/v1/share/restore', method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"file_ids":[]}' });
+assert('restore 转发 200（原样透传，不注入）', r.status === 200, `got ${r.status}`);
+assert('转发头不含注入的 x-captcha-token', fwdHeaders !== null && !('x-captcha-token' in fwdHeaders), JSON.stringify(fwdHeaders));
+globalThis.fetch = realFetch;
+
+// 15. xunlei-op 自有路由（账号相关 ops 由 backend 代发；前端只发意图）
+const { onRequestPost: opPost, onRequestOptions: opOptions } = await import('../functions/api/xunlei-op.js');
+async function opCall(payload, { token = 'test-token', ip = '5.5.5.5', env = { PROXY_TOKEN: 'test-token' } } = {}) {
+  const req = new Request('https://example.com/api/xunlei/op', {
+    method: 'POST',
+    headers: { 'x-proxy-token': token, 'cf-connecting-ip': ip, 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return opPost({ request: req, env });
+}
+r = await opCall({ op: 'download', fid: 'x' }, { token: '' });
+assert('op 无令牌 -> 401', r.status === 401, `got ${r.status}`);
+r = await opCall({ op: 'nope' });
+assert('op 非法 op -> 400', r.status === 400, `got ${r.status}`);
+r = await opCall({ op: 'download', fid: 'x' });
+assert('op 未配置 BACKEND_URL -> 501', r.status === 501 && (await r.json()).error === 'BACKEND_NOT_CONFIGURED', `got ${r.status}`);
+const opEnv = { PROXY_TOKEN: 'test-token', BACKEND_URL: 'http://backend.test' };
+globalThis.fetch = async (url, init) => {
+  assert('op 透传目标 = backend /api/xunlei/op', String(url) === 'http://backend.test/api/xunlei/op', String(url));
+  assert('op 透传 X-Proxy-Token', init.headers['x-proxy-token'] === 'test-token');
+  assert('op 透传请求体（op 名）', JSON.parse(init.body).op === 'download');
+  return new Response(JSON.stringify({ ok: true, url: 'https://dl/x', expiresAt: 123 }), { status: 200, headers: { 'content-type': 'application/json' } });
+};
+r = await opCall({ op: 'download', fid: 'x' }, { env: opEnv });
+const od = await r.json();
+assert('op 原样透传 backend 结果', r.status === 200 && od.ok === true && od.url === 'https://dl/x' && od.expiresAt === 123, JSON.stringify(od));
+globalThis.fetch = async () => { throw new Error('boom'); };
+r = await opCall({ op: 'download', fid: 'x' }, { env: opEnv });
+assert('op backend 不可达 -> 502', r.status === 502 && (await r.json()).error === 'BACKEND_UNREACHABLE', `got ${r.status}`);
+globalThis.fetch = async () => new Response('not-json', { status: 200 });
+r = await opCall({ op: 'download', fid: 'x' }, { env: opEnv });
+assert('op backend 非 JSON -> 502', r.status === 502 && (await r.json()).error === 'BACKEND_BAD_RESPONSE', `got ${r.status}`);
+globalThis.fetch = realFetch;
+const opPre = opOptions();
+assert('op OPTIONS -> 204 + CORS', opPre.status === 204 && opPre.headers.get('access-control-allow-methods')?.includes('POST'));
+
 console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

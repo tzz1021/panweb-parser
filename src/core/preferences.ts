@@ -71,6 +71,12 @@ export const DEFAULTS: Preferences = {
   quark: {
     qkGuestTurn: false,
   },
+  // v1.4：迅雷专属偏好（scan 单页 30 = 官方默认；大宗重跑开；解析后隐秘参数关）
+  xunlei: {
+    scanLimit: 30,
+    bulkRetry: true,
+    fileHiddenVolumn: false,
+  },
   /** v1.1.4：资源复用窗口（小时）；0 = 不复用 */
   reuseWindowHours: 1,
   footprint: {
@@ -94,6 +100,7 @@ function cloneDefaults(): Preferences {
     footprint: { ...DEFAULTS.footprint },
     advanced: { ...DEFAULTS.advanced },
     quark: { ...DEFAULTS.quark },
+    xunlei: { ...DEFAULTS.xunlei },
   };
 }
 
@@ -177,6 +184,7 @@ function mergePrefs(base: Preferences, patch: Partial<Preferences>): Preferences
   merged.footprint = mergeGroup(base.footprint, patch.footprint);
   merged.advanced = mergeGroup(base.advanced, patch.advanced);
   merged.quark = mergeGroup(base.quark, patch.quark);
+  merged.xunlei = mergeGroup(base.xunlei, patch.xunlei);
   return merged;
 }
 

@@ -29,7 +29,7 @@ export const PAN_LIST: PanMeta[] = [
   { id: 'ecloud', short: '翼', name: '天翼云盘', available: false, logo: '/logos/cloud189.png' },
   { id: 'ctt', short: '城', name: '城通网盘', available: false, logo: '/logos/ctfile.png' },
   { id: '123', short: '123', name: '123 网盘', available: false, logo: '/logos/123pan.png' },
-  { id: 'xunlei', short: '迅', name: '迅雷网盘', available: false, logo: '/logos/xunleiyunpan.png' },
+  { id: 'xunlei', short: '迅', name: '迅雷网盘', available: true, logo: '/logos/xunleiyunpan.png' },
   { id: 'guangya', short: '光', name: '光鸭', available: false, logo: '/logos/guangyapan.png' },
   { id: '115', short: '115', name: '115 网盘', available: false, logo: '/logos/115open.png' },
 ];
