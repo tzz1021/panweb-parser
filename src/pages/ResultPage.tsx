@@ -205,6 +205,10 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
   const [links, setLinks] = useState<Map<string, LinkEntry> | null>(null);
   const [fetching, setFetching] = useState(false);
   const [fetchProgress, setFetchProgress] = useState<{ done: number; total: number } | null>(null);
+  // v1.4 迅雷取链方案弹窗（批量只弹一次）：自动（按设置规则）/ CONSUME / PLAY
+  const [usageChoice, setUsageChoice] = useState<{ files: ShareFile[] } | null>(null);
+  // v1.4 后端断线专属弹窗（op NO_BACKEND / 405 / 501 / 502 等）
+  const [backendDown, setBackendDown] = useState(false);
   const [exportKind, setExportKind] = useState<TaskKind>('aria2');
   const [keepStructure, setKeepStructure] = useState(prefs.keepStructure);
   const [exportFail, setExportFail] = useState(false);
@@ -393,6 +397,11 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
       return;
     }
     if (fetching) return;
+    // v1.4 迅雷：先弹「取链方案」选择（自动/CONSUME/PLAY），选定后本批次全部文件用该 usage；批量只弹一次
+    if (adapter.id === 'xunlei') {
+      setUsageChoice({ files });
+      return;
+    }
     pendingFetch.current = files;
     addGlobalLog('=====解析下载方式（prase）=====');
     // v1.2.x 复用分家：直链复用按上游过期时间判定（linkStatus），不再看 reuseWindowHours
@@ -446,9 +455,10 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
 
   /** 真正执行 prase（每个下载响应下发的 __pugs 与该响应的直链绑定，§12）
    * @param guestMode v1.1.9.final：qk-guestTurn 游客模式（不注入登录态整串） */
-  const doFetchLinks = async (files: ShareFile[], guestMode = false): Promise<void> => {
+  const doFetchLinks = async (files: ShareFile[], guestMode = false, usage?: 'CONSUME' | 'PLAY'): Promise<void> => {
     setFetching(true);
     setFetchProgress({ done: 0, total: files.length });
+    let backendDownDetected = false;
     try {
       // ① 窗口内复用：未过期直链直接并入结果，不请求接口
       const toFetch: ShareFile[] = [];
@@ -478,6 +488,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
             batchSize: 15,
             batchIntervalMs: 1000,
             continueOnError: true,
+            usage, // v1.4 迅雷取链方案（弹窗选择；undefined = 适配器按设置规则）
             onProgress: (e) => {
               if (e.done < progLastDone) progBase += progLastDone; // 新批：本批 done 归零 → 累加偏移
               progLastDone = e.done;
@@ -486,6 +497,24 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
           },
         );
         addGlobalLog(`prase：接口完成 — ${results.filter((r) => r.ok).length}/${toFetch.length} 成功`);
+        // v1.4 后端断线：op 返回 NO_BACKEND / 405 / 501 / 502 等 → 专属弹窗（一次，不逐文件弹）
+        const OFFLINE_CODES = new Set([
+          'NO_BACKEND',
+          'BACKEND_NOT_CONFIGURED',
+          'BACKEND_UNREACHABLE',
+          'BACKEND_BAD_RESPONSE',
+          'XUNLEI_CAPTCHA_UNAVAILABLE',
+          'METHOD_NOT_ALLOWED',
+          'OP_HTTP_405',
+          'OP_HTTP_501',
+          'OP_HTTP_502',
+        ]);
+        backendDownDetected =
+          adapter.id === 'xunlei' && results.some((r) => !r.ok && r.errorCode !== undefined && OFFLINE_CODES.has(String(r.errorCode)));
+        if (backendDownDetected) {
+          setBackendDown(true);
+          toast('后端断线了：无法自动取链，请手动转存后自行选择 CONSUME / PLAY 方式取链（见 docs/xunlei-dl-choices.md）', 'error');
+        }
       }
       const map = new Map<string, LinkEntry>();
       let okCount = 0;
@@ -592,7 +621,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
         });
       }
       // ③ 单文件解析失败 → 醒目弹窗（v1.1.4 规范：打开发 modal，关闭发 toast）
-      if (files.length === 1 && okCount === 0) {
+      if (files.length === 1 && okCount === 0 && !backendDownDetected) {
         if (prefs.modals.parseFailWarn) {
           setParseFail({ fileName: files[0].fileName });
         } else {
@@ -1426,6 +1455,95 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
           }}
           onClose={() => setHiddenVolumn(null)}
         />
+      )}
+      {/* v1.4 迅雷取链方案选择（批量只弹一次；默认自动 = 按设置规则） */}
+      {usageChoice && (
+        <div className="modal-mask" onClick={() => setUsageChoice(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <div className="modal-head">
+              <h3 className="modal-title">选择取链方案，暂不支持云解压</h3>
+              <button type="button" className="modal-close" onClick={() => setUsageChoice(null)} aria-label="关闭">
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, color: 'var(--text-dim)' }}>
+                影响取直链接口的 usage 参数：<strong>PLAY</strong> 通常更快（压缩包有奇效），<strong>CONSUME</strong> 为默认。
+                选定后本次批次全部文件使用该方案；更多差异见{' '}
+                <a
+                  href="https://github.com/tzz1021/panweb-parser/blob/master/docs/xunlei-dl-choices.md"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  docs/xunlei-dl-choices.md
+                </a>
+                。
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    const f = usageChoice.files;
+                    setUsageChoice(null);
+                    void doFetchLinks(f, false);
+                  }}
+                >
+                  自动（按设置规则）
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    const f = usageChoice.files;
+                    setUsageChoice(null);
+                    void doFetchLinks(f, false, 'CONSUME');
+                  }}
+                >
+                  CONSUME（默认）
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    const f = usageChoice.files;
+                    setUsageChoice(null);
+                    void doFetchLinks(f, false, 'PLAY');
+                  }}
+                >
+                  PLAY（流式，通常更快）
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* v1.4 后端断线专属弹窗（一次即可，不逐文件弹） */}
+      {backendDown && (
+        <div className="modal-mask" onClick={() => setBackendDown(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <div className="modal-head">
+              <h3 className="modal-title">后端断线了。。。</h3>
+              <button type="button" className="modal-close" onClick={() => setBackendDown(false)} aria-label="关闭">
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, color: 'var(--text-dim)' }}>
+                无法自动取链（托管后端未连接 / 未配置）。请<strong>手动转存</strong>后，自行选择{' '}
+                <strong>CONSUME</strong> / <strong>PLAY</strong> 方式取链；方案差异见{' '}
+                <a
+                  href="https://github.com/tzz1021/panweb-parser/blob/master/docs/xunlei-dl-choices.md"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  docs/xunlei-dl-choices.md
+                </a>
+                。
+              </p>
+            </div>
+          </div>
+        </div>
       )}
       {/* v1.1.7 导出包含黄色标记 → 弹窗（设置开关 exportYellowWarn，关=简略 toast） */}
       {exportYellow && <ExportYellowModal onClose={() => setExportYellow(false)} />}

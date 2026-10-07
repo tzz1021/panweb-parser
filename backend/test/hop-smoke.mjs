@@ -300,6 +300,14 @@ check('op restore → trace_file_ids 映射', opRestore.ok === true && opRestore
 const bizHit = mockHits.filter((h) => h.url.includes('/drive/') && h.headers['x-captcha-token']).pop();
 check('上游业务请求带 backend 自己的 device/captcha/authorization', Boolean(bizHit) && bizHit.headers['x-device-id'] === fakeDevice && bizHit.headers['authorization'] === 'Bearer FAKE-AUTH' && Boolean(bizHit.headers['x-captcha-token']), JSON.stringify(bizHit && { dev: bizHit.headers['x-device-id'], auth: bizHit.headers['authorization'], act: bizHit.url }));
 
+// ⑩.8 v1.4：取链参数 usage（CONSUME/PLAY）透传到上游 query（白名单外回落 CONSUME）
+const opPlay = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1', usage: 'PLAY' }) })).json();
+const playHit = mockHits.filter((h) => h.url.includes('/drive/v1/files/')).pop();
+check('op download usage=PLAY → 上游 query usage=PLAY', opPlay.ok === true && /usage=PLAY/.test(playHit?.url ?? ''), playHit?.url);
+const opBadUsage = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1', usage: 'WEIRD' }) })).json();
+const badHit = mockHits.filter((h) => h.url.includes('/drive/v1/files/')).pop();
+check('非法 usage 回落 CONSUME', opBadUsage.ok === true && /usage=CONSUME/.test(badHit?.url ?? ''), badHit?.url);
+
 // ⑪ 严格终端：未开启时 ws 应 403；开启后过滤高危命令
 r = await fetch(`${base}/api/web/settings`, {
   method: 'POST',

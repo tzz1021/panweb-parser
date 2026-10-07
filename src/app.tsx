@@ -17,7 +17,7 @@ import { ToastProvider } from './components/Toast';
 import type { ParseSession } from './core/types';
 
 /** 仓库地址（占位：仓库建好后指向真实地址） */
-const REPO_URL = 'https://github.com/tzz1021/panhub_praser';
+const REPO_URL = 'https://github.com/tzz1021/panweb-parser';
 
 /** hash 路由 hook */
 function useHashRoute(): string {
@@ -71,7 +71,7 @@ function SiteHeader({ onOpenSettings }: { onOpenSettings: () => void }): ReactNo
         }}
       >
         <span className="brand-logo">☁️</span>
-        <span className="brand-name">panhub_praser</span>
+        <span className="brand-name">panweb-parser</span>
       </a>
       <div className="header-actions">
         <button type="button" className="btn btn-ghost" onClick={() => (window.location.hash = '#/history')}>

@@ -172,7 +172,7 @@ export function HistoryPage({ onReparse }: HistoryPageProps): JSX.Element {
       fileCount: r.fileCount,
       error: r.error ?? null,
     }));
-    const fileName = `panhub-praser-history-${new Date().toISOString().slice(0, 10)}.json`;
+    const fileName = `panweb-parser-history-${new Date().toISOString().slice(0, 10)}.json`;
     downloadFile(fileName, JSON.stringify(payload, null, 2));
     toast(`已导出 ${payload.length} 条历史记录`, 'success');
   };
@@ -209,7 +209,7 @@ export function HistoryPage({ onReparse }: HistoryPageProps): JSX.Element {
   const downloadRaw = (): void => {
     if (!raw) return;
     const safeName = raw.title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 40) || 'record';
-    downloadFile(`panhub-praser-raw-${safeName}.json`, raw.json);
+    downloadFile(`panweb-parser-raw-${safeName}.json`, raw.json);
   };
 
   return (

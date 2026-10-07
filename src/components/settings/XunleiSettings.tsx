@@ -11,6 +11,7 @@
  */
 import type { JSX } from 'react';
 import type { XunleiPrefs } from '../../core/types';
+import { parseDlChoiceRules } from '../../adapters/xunlei/choices';
 import { Switch } from './UacTable';
 
 export interface XunleiSettingsProps {
@@ -59,6 +60,37 @@ export function XunleiSettings({ xunlei, onChange }: XunleiSettingsProps): JSX.E
           onChange={(v) => onChange({ fileHiddenVolumn: v })}
           label="解析后显示文件隐秘参数"
         />
+      </div>
+      <div className="switch-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
+        <div>
+          <div className="switch-label">最后一个接口参数（取链方案）</div>
+          <div className="switch-sub">
+            每行一条规则，按**文件名**自上而下匹配，命中即用；无命中 → CONSUME。`-regex` 区分大小写，`-iregex` 不区分。
+            格式：<code>{'-regex ".*\\.\\(xls|ppt|docx|pdf\\)$" = CONSUME'}</code>；说明见{' '}
+            <a
+              href="https://github.com/tzz1021/panweb-parser/blob/master/docs/xunlei-dl-choices.md"
+              target="_blank"
+              rel="noreferrer"
+            >
+              docs/xunlei-dl-choices.md
+            </a>
+            。
+          </div>
+        </div>
+        <textarea
+          className="input"
+          rows={4}
+          spellCheck={false}
+          style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+          value={xunlei.dlChoiceRules}
+          onChange={(e) => onChange({ dlChoiceRules: e.target.value })}
+          placeholder={'-regex ".*\\.\\(xls|ppt|docx|pdf\\)$" = CONSUME\n-iregex ".*\\.\\(ts|mp4|mov\\)$" = PLAY'}
+        />
+        {parseDlChoiceRules(xunlei.dlChoiceRules).invalid.length > 0 && (
+          <div style={{ fontSize: 12, color: 'var(--text-faint)' }}>
+            忽略的非法行：{parseDlChoiceRules(xunlei.dlChoiceRules).invalid.join(' ｜ ')}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -3,7 +3,7 @@
   "version": "0.1.0-next",
   "private": true,
   "type": "module",
-  "description": "panhub_praser 指挥中心（增强 hop + 管理面板，docs/backend-wrangler-plan.md v1.2.1）",
+  "description": "panweb-parser 指挥中心（增强 hop + 管理面板，docs/backend-wrangler-plan.md v1.2.1）",
   "scripts": {
     "dev": "node src/index.js",
     "build:webui": "vite build --config webui/vite.config.js",

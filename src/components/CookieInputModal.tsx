@@ -383,11 +383,11 @@ export function CookieInputModal({
             )}
             <RedDot>
             更推荐：使用{' '}
-            <a href="http://github.com/tzz1021/panhub_praser/tree/dev" target="_blank" rel="noreferrer">
+            <a href="https://github.com/tzz1021/panweb-parser/tree/dev" target="_blank" rel="noreferrer">
             本机插件模式（dev 分支）
             </a>
             ，或者自建转发代理（参考{' '}
-            <a href="https://github.com/tzz1021/panhub_praser/blob/master/docs/wiki-selfhost.md" target="_blank" rel="noreferrer">
+            <a href="https://github.com/tzz1021/panweb-parser/blob/master/docs/wiki-selfhost.md" target="_blank" rel="noreferrer">
             selfhost-Wiki
             </a>
             ）

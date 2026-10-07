@@ -20,7 +20,7 @@
 # ============================================================================
 set -euo pipefail
 
-REPO="tzz1021/panhub_praser"
+REPO="tzz1021/panweb-parser"
 BRANCH="master"
 REPO_URL="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
 MIRROR_PREFIXES=(

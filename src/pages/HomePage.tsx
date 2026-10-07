@@ -9,6 +9,7 @@ import type { JSX } from 'react';
 import type { PanAdapter } from '../adapters/types';
 import type { ShareFile } from '../adapters/types';
 import { detectShareUrl } from '../adapters/registry';
+import { resolveKouling } from '../adapters/xunlei/kouling';
 import { LinkInput, extractShare } from '../components/LinkInput';
 import { PanTable } from '../components/PanTable';
 import { DownloaderModal } from '../components/DownloaderModal';
@@ -73,6 +74,9 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
   const [corsJump, setCorsJump] = useState<{ message: string } | null>(null);
   const { toast } = useToast();
   const [initialValue, setInitialValue] = useState('');
+  // v1.4 手动选盘（首页 pan-chips 点击；选中迅雷时输入框接受口令文字）与口令解析出的链接
+  const [manualPan, setManualPan] = useState<string | null>(null);
+  const [resolvedUrl, setResolvedUrl] = useState<string | undefined>(undefined);
   const lastPending = useRef('');
 
   /**
@@ -121,6 +125,22 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
   };
 
   const handleFetch = async (overrides?: { adapter?: PanAdapter; url?: string; passcode?: string }): Promise<void> => {
+    // v1.4 口令 → 链接：首页选中迅雷网盘且输入不是链接时，先调（无鉴权）jump 接口解析
+    if (!overrides?.url && manualPan === 'xunlei' && url.trim() && !/^https?:\/\//i.test(url.trim())) {
+      const word = url.trim();
+      setBusy(true);
+      const resolved = await resolveKouling(word);
+      setBusy(false);
+      if (!resolved) {
+        toast('口令不存在', 'error');
+        setManualPan(null); // 提示位置从「已选择：迅雷网盘」换回默认文案
+        return;
+      }
+      addGlobalLog(`口令「${word}」已解析为分享链接：${resolved.url}`);
+      setResolvedUrl(resolved.url);
+      await handleFetch({ adapter: detectShareUrl(resolved.url) ?? undefined, url: resolved.url, passcode: resolved.passcode ?? '' });
+      return;
+    }
     const adapter = overrides?.adapter ?? detected;
     const shareUrl = overrides?.url ?? url;
     const pc = overrides?.passcode ?? passcode;
@@ -394,7 +414,8 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
         onFetchFiles={() => void handleFetch()}
         onOpenDownloader={() => setDownloaderOpen(true)}
         busy={busy}
-        initialValue={initialValue}
+        initialValue={resolvedUrl ?? initialValue}
+        manualPanName={manualPan === 'xunlei' ? '迅雷网盘' : null}
       />
       {/* 解析进度（可选展示） */}
       {busy && progress && (
@@ -414,8 +435,12 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
           </div>
         </div>
       )}
-      {/* 网盘种类横向表格（下） */}
-      <PanTable highlightId={highlightId} />
+      {/* 网盘种类横向表格（下；v1.4 首页可点：选迅雷后在输入框输口令文字） */}
+      <PanTable
+        highlightId={highlightId}
+        selectedId={manualPan}
+        onSelect={(id) => setManualPan(id === 'xunlei' ? (manualPan === 'xunlei' ? null : 'xunlei') : null)}
+      />
 
       {downloaderOpen && <DownloaderModal onClose={() => setDownloaderOpen(false)} />}
       {loginJump && (

@@ -122,6 +122,12 @@ export interface XunleiOpPayload {
   fid?: string;
   /** rename 的原始文件名（backend 追加 3 位补零随机数伪装分卷） */
   name?: string;
+  /**
+   * v1.3.3（五批）取链参数：`CONSUME`（默认）/ `PLAY`（流式）。
+   * 影响 `/files/{id}?space=&usage=` 返回的直链集合（PLAY 常比 CONSUME 快，压缩包有奇效）。
+   * backend 只认这两个值，其他一律回落 CONSUME。
+   */
+  usage?: 'CONSUME' | 'PLAY';
 }
 
 /** ops 结果（backend 形状：{ ok, results?, url?, expiresAt?, error?, code? }） */

@@ -1,4 +1,4 @@
-# panhub_praser 🔧
+# panweb-parser 🔧
 
 > 网盘分享链接 → 目录树 → 批量直链 → 一键导出到 aria2 / Gopeed / cURL。
 > 免安装、零上传、开源免费。把分享页变成你自己的下载器。

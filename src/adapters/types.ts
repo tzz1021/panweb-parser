@@ -119,6 +119,11 @@ export interface DownloadParams {
    * 由 core/linkFetcher 从 LinkFetchOptions.onProgress 原样透传（UI 动态进度条用）。
    */
   onProgress?: (evt: LinkProgressEvent) => void;
+  /**
+   * v1.4 取链参数覆盖（可选）：用户在本批弹窗选了 CONSUME/PLAY 时传入；
+   * 缺省 = 适配器按设置规则（文件名匹配）自行决定，再不中则 CONSUME。
+   */
+  usage?: 'CONSUME' | 'PLAY';
 }
 
 /** 单文件直链结果 */

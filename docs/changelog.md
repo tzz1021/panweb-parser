@@ -5,7 +5,7 @@
 
 ## [1.4] 2026-10-03 —— 迅雷云盘适配器（第四个驱动）
 
-> 逆向依据与全部真机证据见 `docs/reverse-notes-xunlei.md`；
+> 状态：**已实现待审**（未 commit / 未 push）。逆向依据与全部真机证据见 `docs/reverse-notes-xunlei.md`；
 > 同号分享策略见 `docs/todo-xunlei-same-account-restore.md`。
 > 未验证：同号链路 rename / 7z·rar 的 rename 已按实测结论写入文档；restore→直链仍未经真实登录态联调。
 

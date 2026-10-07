@@ -76,6 +76,8 @@ export const DEFAULTS: Preferences = {
     scanLimit: 30,
     bulkRetry: true,
     fileHiddenVolumn: false,
+    // 取链方案规则（多行；空 = 全部 CONSUME）；格式见 core/types.ts#XunleiPrefs
+    dlChoiceRules: '',
   },
   /** v1.1.4：资源复用窗口（小时）；0 = 不复用 */
   reuseWindowHours: 1,

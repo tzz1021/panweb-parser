@@ -455,7 +455,8 @@ export async function runOp(op, payload = {}) {
       const r = await xlRequest(account, {
         method: 'GET',
         path: `/drive/v1/files/${encodeURIComponent(fid)}`,
-        query: { space: '', usage: 'CONSUME' },
+        // v1.4 取链参数：调用方（SPA 规则/弹窗）给的 usage；白名单只允许 CONSUME / PLAY，其余一律 CONSUME
+        query: { space: '', usage: payload.usage === 'PLAY' ? 'PLAY' : 'CONSUME' },
         action: 'get:/drive/v1/files',
       });
       const err = upstreamError(r, '获取下载直链');

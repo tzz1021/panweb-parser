@@ -166,6 +166,8 @@ export interface LinkFetchOptions {
    * 供 UI 动态显示进度。批间节流/顺序/失败策略不受其影响。
    */
   onProgress?: (evt: import('../adapters/types').LinkProgressEvent) => void;
+  /** v1.4 取链参数覆盖（可选）：原样透传 DownloadParams.usage（用户弹窗选择）。 */
+  usage?: 'CONSUME' | 'PLAY';
 }
 
 /* ============================== 偏好设置 ============================== */
@@ -200,6 +202,14 @@ export interface XunleiPrefs {
    * 脱敏字段，方便定位后端账号是不是会员号。**不含任何凭据本体**。
    */
   fileHiddenVolumn: boolean;
+  /**
+   * 取链方案规则（多行文本，每行一条；v1.4）——「最后一个接口参数」：
+   *   `-regex ".*\.\(xls\|ppt\|docx\|pdf\)$" = CONSUME`（区分大小写）
+   *   `-iregex ".*\.\(ts\|mp4\|mov\)$" = PLAY`（不区分大小写）
+   * 按**文件名**自上而下匹配，命中即用；无命中 → CONSUME；非法行忽略（UI 浅色提示）。
+   * 说明见 docs/xunlei-dl-choices.md。
+   */
+  dlChoiceRules: string;
 }
 
 /** 弹窗开关（HANDOFF 附件 UAC 表底部全局行） */

@@ -29,6 +29,8 @@
  */
 import type { DownloadParams, DownloadResult, LinkProgressEvent, ShareFile } from '../types';
 import { getActiveTransport, type XunleiOpPayload, type XunleiOpResult } from '../../core/transport/types';
+import { getPreferences } from '../../core/preferences';
+import { resolveUsage, type XlUsage } from './choices';
 import { XL_CARRY_STORAGE_KEY, XL_CARRY_TTL_MS } from './types';
 
 /** ops 之间的固定间隔（Tzz 定稿：settings→1s→restore；rename→1s→download；逐文件 1s） */
@@ -236,6 +238,7 @@ function sizeOfBackend(d: { size?: unknown }, file: ShareFile): number {
 async function fetchOne(
   file: ShareFile,
   fid: string,
+  usage: XlUsage,
   onStage?: (stage: 'rename' | 'download') => void,
 ): Promise<DownloadResult> {
   try {
@@ -245,7 +248,7 @@ async function fetchOne(
       await sleep(XL_OP_INTERVAL_MS); // rename 与 download 之间间隔 1s
     }
     onStage?.('download');
-    const d = await op({ op: 'download', fid }, '获取下载直链');
+    const d = await op({ op: 'download', fid, usage }, '获取下载直链');
     if (!d.url) {
       return { url: '', fileName: file.fileName, size: file.size, error: '未返回直链（backend 结果无 url）', errorCode: 'NO_DOWNLOAD_URL' };
     }
@@ -276,6 +279,10 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
   const failAll = (error: string, errorCode: number | string): DownloadResult[] =>
     files.map((f) => ({ url: '', fileName: f.fileName, size: f.size, error, errorCode }));
 
+  // v1.4 取链参数：显式覆盖（弹窗）> 设置规则（文件名匹配）> CONSUME
+  const dlChoiceRules = String(getPreferences().xunlei?.dlChoiceRules ?? '');
+  const usageOf = (file: ShareFile): XlUsage => resolveUsage(params.usage, dlChoiceRules, file.fileName);
+
   // v1.4 逐文件进度（只报，不影响结果/顺序）：total = 本批文件数；done = 本批已完成数
   let done = 0;
   const emit = (stage: LinkProgressEvent['stage'], fid: string): void => {
@@ -304,7 +311,7 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
     const i0 = needCopy[0];
     try {
       emit('probe', files[i0].fid);
-      const d = await op({ op: 'download', fid: files[i0].fid }, '同号探测（直接取直链）');
+      const d = await op({ op: 'download', fid: files[i0].fid, usage: usageOf(files[i0]) }, '同号探测（直接取直链）');
       sameAccount = true;
       if (d.url) {
         storeDetail(files[i0].fid, d.detail);
@@ -385,7 +392,7 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
             errorCode: 'NO_FILE_ID',
           };
         } else {
-          resultByIdx[i] = await fetchOne(files[i], newId, (stage) => emit(stage, files[i].fid));
+          resultByIdx[i] = await fetchOne(files[i], newId, usageOf(files[i]), (stage) => emit(stage, files[i].fid));
         }
       }
       finish(i);

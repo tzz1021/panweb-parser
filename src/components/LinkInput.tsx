@@ -55,6 +55,11 @@ export interface LinkInputProps {
   detectFailText?: string;
   /** 外部预填链接（1.0.1 历史页"重新解析"；变化时触发一次） */
   initialValue?: string;
+  /**
+   * v1.4 手动选择网盘（首页 pan-chips 点击）：非空时识别提示改为「已选择：<name>」，
+   * 输入框接受口令文字（如迅雷口令），placeholder 同步切换。
+   */
+  manualPanName?: string | null;
 }
 
 export function LinkInput({
@@ -65,6 +70,7 @@ export function LinkInput({
   busy,
   detectFailText = '识别失败，请检查格式是否正确',
   initialValue,
+  manualPanName,
 }: LinkInputProps): JSX.Element {
   const [url, setUrl] = useState('');
   const [passcode, setPasscode] = useState('');
@@ -149,7 +155,7 @@ export function LinkInput({
           <input
             className="input"
             list="panhub-history"
-            placeholder="粘贴后自动识别驱动种类，支持长短两种链接"
+            placeholder={manualPanName ? '输入口令文字（如：张三丰资源），或直接粘贴分享链接' : '粘贴后自动识别驱动种类，支持长短两种链接'}
             value={url}
             onChange={(e) => handleChange(e.target.value)}
             onKeyDown={(e) => {
@@ -178,7 +184,12 @@ export function LinkInput({
           </button>
         </div>
         <div className="detect-hint">
-          {detectMsg ? (
+          {manualPanName ? (
+            <>
+              <span className="ok">✓</span>
+              已选择：{manualPanName}（输入口令文字或粘贴该网盘链接）
+            </>
+          ) : detectMsg ? (
             <>
               <span className={detectMsg.ok ? 'ok' : 'bad'}>{detectMsg.ok ? '✓' : '✗'}</span>
               {detectMsg.text}

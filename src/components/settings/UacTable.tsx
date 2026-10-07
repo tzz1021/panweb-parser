@@ -15,6 +15,7 @@ import { useToast } from '../Toast';
 import { getActiveTransport, setActiveTransport, transportFromPrefs } from '../../core/transport/types';
 import { ProxyTransport } from '../../core/transport/types';
 import { listAllRecords } from '../../core/footprint/records';
+import { extractShare } from '../LinkInput';
 import { mergeUacLimits, UAC_EXTRA_LIMITS, UAC_ROWS } from './uacData';
 
 /** 开关 */
@@ -211,7 +212,9 @@ export function UacTable({ modals, onModalsChange, transport, onTransportChange 
               const prev = getActiveTransport();
               setActiveTransport(new ProxyTransport(url, tokenDraft.trim()));
               try {
-                await adapter.getToken({ shareId, passcode: '' });
+                // v1.4 fix：测试也要带提取码（从历史链接里取 pwd=xxx），否则需要码的分享会空发
+                const pc = extractShare(rec.url).passcode ?? '';
+                await adapter.getToken({ shareId, passcode: pc });
                 toast('代理连通，最新分享链接解析成功 ✅', 'success');
               } catch (err) {
                 toast(`测试失败：${err instanceof Error ? err.message : String(err)}`, 'error');
