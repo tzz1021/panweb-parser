@@ -77,6 +77,8 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
   // v1.4 手动选盘（首页 pan-chips 点击；选中迅雷时输入框接受口令文字）与口令解析出的链接
   const [manualPan, setManualPan] = useState<string | null>(null);
   const [resolvedUrl, setResolvedUrl] = useState<string | undefined>(undefined);
+  // v1.4 后端断线专属弹窗（口令解析请求层失败时也弹）
+  const [backendDown, setBackendDown] = useState(false);
   const lastPending = useRef('');
 
   /**
@@ -129,16 +131,22 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
     if (!overrides?.url && manualPan === 'xunlei' && url.trim() && !/^https?:\/\//i.test(url.trim())) {
       const word = url.trim();
       setBusy(true);
-      const resolved = await resolveKouling(word);
+      const outcome = await resolveKouling(word);
       setBusy(false);
-      if (!resolved) {
-        toast('口令不存在', 'error');
-        setManualPan(null); // 提示位置从「已选择：迅雷网盘」换回默认文案
+      if (!outcome.ok) {
+        if (outcome.reason === 'offline') {
+          // 请求层失败（网络/CORS/非 2xx/非 JSON）→ 断线弹窗（**不是**口令不存在）
+          setBackendDown(true);
+          toast('后端断线了：口令解析请求没到达，请检查代理地址/后台是否在线', 'error');
+        } else {
+          toast('口令不存在', 'error');
+          setManualPan(null); // 提示位置从「已选择：迅雷网盘」换回默认文案
+        }
         return;
       }
-      addGlobalLog(`口令「${word}」已解析为分享链接：${resolved.url}`);
-      setResolvedUrl(resolved.url);
-      await handleFetch({ adapter: detectShareUrl(resolved.url) ?? undefined, url: resolved.url, passcode: resolved.passcode ?? '' });
+      addGlobalLog(`口令「${word}」已解析为分享链接：${outcome.url}`);
+      setResolvedUrl(outcome.url);
+      await handleFetch({ adapter: detectShareUrl(outcome.url) ?? undefined, url: outcome.url, passcode: outcome.passcode ?? '' });
       return;
     }
     const adapter = overrides?.adapter ?? detected;
@@ -443,6 +451,33 @@ export function HomePage({ onParsed, onOpenSettings, pending }: HomePageProps): 
       />
 
       {downloaderOpen && <DownloaderModal onClose={() => setDownloaderOpen(false)} />}
+      {/* v1.4 后端断线专属弹窗（口令解析/取链端点探测失败时） */}
+      {backendDown && (
+        <div className="modal-mask" onClick={() => setBackendDown(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <div className="modal-head">
+              <h3 className="modal-title">后端断线了。。。</h3>
+              <button type="button" className="modal-close" onClick={() => setBackendDown(false)} aria-label="关闭">
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, color: 'var(--text-dim)' }}>
+                无法自动取链（托管后端未连接 / 未配置 / 口令解析请求没到达）。请<strong>手动转存</strong>后，自行选择{' '}
+                <strong>CONSUME</strong> / <strong>PLAY</strong> 方式取链；方案差异见{' '}
+                <a
+                  href="https://github.com/tzz1021/panweb-parser/blob/master/docs/xunlei-dl-choices.md"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  docs/xunlei-dl-choices.md
+                </a>
+                。
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
       {loginJump && (
         <LoginJumpModal
           message={loginJump.message}

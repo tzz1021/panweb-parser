@@ -18,7 +18,9 @@
  * 测试：`PANHUB_XUNLEI_CAPTCHA_BASE` 可覆盖上游基址（hop-smoke 用它指向本地 mock，绝不打真上游）。
  */
 import { getConfig } from './config.js';
-import { getSetting, getDb, decrypt } from './db.js';
+import { getSetting, setSetting, getDb, decrypt } from './db.js';
+import { upsertAccount } from './cookies.js';
+import { decodeXunleiJwt } from './xunlei-cdp.js';
 
 /** 内置 web 端身份默认值（Tzz 浏览器抓包；与 src/adapters/xunlei/types.ts#XL_WEB_CLIENT 同源） */
 const WEB_DEFAULTS = {
@@ -197,6 +199,108 @@ export async function captchaTokenForAction(action, opts = {}) {
   const expiresIn = typeof data.expires_in === 'number' && data.expires_in > 0 ? data.expires_in : CAPTCHA_DEFAULT_TTL_S;
   tokenCache.set(act, { token: data.captcha_token, expiresAt: now + expiresIn * 1000 });
   return { captcha_token: data.captcha_token, expires_in: expiresIn, cached: false };
+}
+
+/* ===================== v1.4 CDP 抓取凭据的落库 / 状态 ===================== */
+
+/** 凭据串拼装（与 PAN_KEYS.xunlei / xunleiAccount() 的解析对齐） */
+function credentialStringOf({ authorization, toParentId, userId }) {
+  const parts = [`authorization=${authorization}`];
+  if (toParentId) parts.push(`to_parent_id=${toParentId}`);
+  if (userId) parts.push(`user_id=${userId}`);
+  return parts.join(';');
+}
+
+/**
+ * 落库一份 CDP 抓到的迅雷凭据（面板一条龙）：
+ * - 设置项（runOp 的第一优先来源）：`xunlei_authorization` / `xunlei_user_id` / `xunlei_device_id`，
+ *   以及 captcha 身份的滚动来源 `package_name` / `client_version` / `captcha_sign` / `captcha_timestamp`
+ *   （**有才写**，没有不算失败）；`to_parent_id` 已有则不覆盖（除非显式传入）。
+ * - 账号池 `pan='xunlei'`：存「凭据串」（与 PAN_KEYS.xunlei 对齐），面板/终端可见、可手工维护。
+ * @returns {{userId:string|null, deviceId:string, hasCaptchaSign:boolean, expiresAt:number|null, accountId:number|null}}
+ */
+export function saveXunleiCapturedCredential({ authorization, userId, deviceId, captchaMeta, toParentId, accountId: reuseAccountId } = {}) {
+  const auth = String(authorization ?? '').trim();
+  if (!auth) throw new XunleiTokenConfigError('未提供 authorization，无法落库');
+
+  setSetting('xunlei_authorization', auth);
+  if (userId) setSetting('xunlei_user_id', String(userId));
+  if (deviceId) setSetting('xunlei_device_id', String(deviceId));
+  const parent = String(toParentId ?? '').trim() || xunleiSetting('to_parent_id');
+  if (parent) setSetting('xunlei_to_parent_id', parent);
+  if (captchaMeta) {
+    if (captchaMeta.packageName) setSetting('xunlei_package_name', String(captchaMeta.packageName));
+    if (captchaMeta.clientVersion) setSetting('xunlei_client_version', String(captchaMeta.clientVersion));
+    if (captchaMeta.captchaSign) setSetting('xunlei_captcha_sign', String(captchaMeta.captchaSign));
+    if (captchaMeta.timestamp) setSetting('xunlei_captcha_timestamp', String(captchaMeta.timestamp));
+  }
+  setSetting('xunlei_credential_at', String(Date.now()));
+  // device/sign 可能变了 → 清 token 缓存（下次重新 init）
+  clearXunleiTokenCache();
+
+  // 账号池镜像（面板/终端可见；读写分离：接口不回凭据本体）
+  let accountId = null;
+  try {
+    accountId = upsertAccount(
+      { id: Number(reuseAccountId) > 0 ? Number(reuseAccountId) : undefined, pan: 'xunlei', label: userId ? `xunlei#${userId}` : 'xunlei', cookieString: credentialStringOf({ authorization: auth, toParentId: parent, userId }) },
+      'cdp',
+    );
+  } catch {
+    // 账号池写失败不影响设置项生效（runOp 以设置为准）
+    accountId = null;
+  }
+
+  const jwt = decodeXunleiJwt(auth);
+  return {
+    userId: userId ? String(userId) : (jwt?.userId ?? null),
+    deviceId: String(deviceId ?? xunleiSetting('device_id') ?? ''),
+    hasCaptchaSign: Boolean(xunleiSetting('captcha_sign')),
+    expiresAt: jwt?.exp ?? null,
+    accountId: typeof accountId === 'number' ? accountId : null,
+  };
+}
+
+/**
+ * 按 userId 找已存在的 xunlei 账号（v1.4.1：避免同一浏览器/同一身份被反复新建账号）。
+ * 凭据串里带 `user_id=…`（CDP 抓取时写入）→ 从这里比对；找不到返回 null。
+ */
+export function findXunleiAccountIdByUserId(userId) {
+  const want = String(userId ?? '').trim();
+  if (!want) return null;
+  try {
+    const rows = getDb().prepare("SELECT id, cookie_enc FROM accounts WHERE pan = 'xunlei' AND kind = 'real'").all();
+    for (const r of rows) {
+      const parsed = parseXunleiCredential(decrypt(r.cookie_enc));
+      if (parsed.userId && parsed.userId === want) return Number(r.id);
+    }
+  } catch {
+    /* 账号池不可用 → 当没有 */
+  }
+  return null;
+}
+
+/** 脱敏状态（面板展示；**绝不回 authorization**） */
+export function xunleiCredentialStatus() {
+  const auth = xunleiSetting('authorization');
+  const jwt = auth ? decodeXunleiJwt(auth) : null;
+  const expiresAt = jwt?.exp ?? null;
+  const lastRefreshedAt = Number(xunleiSetting('credential_at')) || null;
+  const minIntervalMs = 5 * 60_000;
+  const nextAllowedAt = lastRefreshedAt ? lastRefreshedAt + minIntervalMs : null;
+  return {
+    authorizationSet: Boolean(auth),
+    userId: xunleiSetting('user_id') || jwt?.userId || null,
+    expiresAt,
+    /** true/false = 按 JWT exp 离线判定；null = 无 token 或解不出 exp */
+    valid: expiresAt === null ? null : expiresAt > Date.now(),
+    deviceId: xunleiSetting('device_id') || null,
+    hasCaptchaSign: Boolean(xunleiSetting('captcha_sign')),
+    toParentId: xunleiSetting('to_parent_id') || null,
+    lastRefreshedAt,
+    /** v1.4.1：限频（面板按钮置灰用，与其它驱动预设一致的 5 分钟） */
+    minIntervalMs,
+    nextAllowedAt: nextAllowedAt && nextAllowedAt > Date.now() ? nextAllowedAt : null,
+  };
 }
 
 /* ===================== v1.4 账号相关 ops（settings/restore/rename/download） ===================== */
@@ -380,6 +484,10 @@ function expiresOf(url, expireIso) {
  * @returns {{ok:boolean, results?:Array<{fid:string,fileId:string}>, url?:string, expiresAt?:number, size?:number|string, detail?:object, name?:string, error?:string, code?:string, message?:string}}
  */
 export async function runOp(op, payload = {}) {
+  // ping：端点探活（SPA 解析前先探；**不碰上游、不查账号**）
+  if (op === 'ping') {
+    return { ok: true, pong: true };
+  }
   const account = xunleiAccount();
   if (!account) {
     return opFail(

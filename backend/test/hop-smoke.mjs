@@ -1,8 +1,8 @@
 /* backend v0.1.0-next 冒烟测试（不依赖 wrangler 的链路部分） */
 import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const BACKEND = new URL('../', import.meta.url).pathname;
 const DATA = join(BACKEND, 'data');
@@ -48,7 +48,7 @@ const mockPort = mockSrv.address().port;
 const port = 18881;
 const child = spawn(process.execPath, ['src/index.js', '--port', String(port)], {
   cwd: BACKEND,
-  env: { ...process.env, PANHUB_NO_SPAWN: '1', PANHUB_XUNLEI_CAPTCHA_BASE: `http://127.0.0.1:${mockPort}`, PANHUB_XUNLEI_API_BASE: `http://127.0.0.1:${mockPort}` },
+  env: { ...process.env, PANHUB_NO_SPAWN: '1', PANHUB_XUNLEI_CAPTCHA_BASE: `http://127.0.0.1:${mockPort}`, PANHUB_XUNLEI_API_BASE: `http://127.0.0.1:${mockPort}`, PANHUB_XUNLEI_CDP_STUB_FILE: join(BACKEND, 'data', 'tmp', 'xunlei-cdp-stub.json') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let out = '';
@@ -307,6 +307,186 @@ check('op download usage=PLAY → 上游 query usage=PLAY', opPlay.ok === true &
 const opBadUsage = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1', usage: 'WEIRD' }) })).json();
 const badHit = mockHits.filter((h) => h.url.includes('/drive/v1/files/')).pop();
 check('非法 usage 回落 CONSUME', opBadUsage.ok === true && /usage=CONSUME/.test(badHit?.url ?? ''), badHit?.url);
+
+// ⑩.9 v1.4：op 探活 ping（SPA 解析前先探端点）——200 + {ok:true}，且不碰上游
+const hitsBeforePing = mockHits.length;
+const pingRes = await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'ping' }) });
+const pingBody = await pingRes.json();
+check('op ping → 200 {ok:true}', pingRes.status === 200 && pingBody.ok === true, JSON.stringify(pingBody));
+check('op ping 不打上游（mock 零新增）', mockHits.length === hitsBeforePing, `+${mockHits.length - hitsBeforePing}`);
+
+// ⑩.95 v1.4 迅雷凭据：CDP 抓取（stub 文件驱动，不依赖真浏览器）
+const stubPath = join(BACKEND, 'data', 'tmp', 'xunlei-cdp-stub.json');
+const jwtPayload = Buffer.from(JSON.stringify({ sub: '1367069689', exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url');
+const fakeAuth = `Bearer ${Buffer.from('{"alg":"none"}').toString('base64url')}.${jwtPayload}.sig`;
+const writeStub = (obj) => { mkdirSync(dirname(stubPath), { recursive: true }); writeFileSync(stubPath, JSON.stringify(obj)); };
+const capReq = (confirm) => fetch(`${base}/api/xunlei/credential/cdp`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify(confirm ? { confirmToken: webuiToken } : {}),
+});
+
+check('迅雷凭据 status 无令牌 → 401', (await fetch(`${base}/api/xunlei/credential/status`)).status === 401);
+const capNoConfirm = await capReq(false);
+check('迅雷凭据抓取缺二次令牌 → 403', capNoConfirm.status === 403, `status=${capNoConfirm.status}`);
+
+writeStub({ error: 'connect-failed' });
+let capRes = await capReq(true);
+let capBody = await capRes.json();
+check('CDP 不可用 → 503 + 中文指引', capRes.status === 503 && capBody.error === 'CDP_UNAVAILABLE' && /remote-debugging-port/.test(capBody.message ?? ''), JSON.stringify(capBody));
+
+writeStub({ requests: [{ url: 'https://pan.xunlei.com/static/app.js', headers: {} }] });
+capRes = await capReq(true);
+capBody = await capRes.json();
+check('未登录（无 authorization 请求）→ 409 NOT_LOGGED_IN + 指引', capRes.status === 409 && capBody.error === 'NOT_LOGGED_IN' && /登录/.test(capBody.message ?? ''), JSON.stringify(capBody));
+
+// fakeAuth 已在前面定义（⑩.98 绑定锁断言用同一个假 JWT）
+writeStub({
+  requests: [
+    { url: 'https://api-pan.xunlei.com/drive/v1/files/abc?space=&usage=CONSUME', headers: { authorization: fakeAuth, 'x-device-id': '550cfe136e9d74e95be5393738639de7' } },
+    { url: 'https://xluser-ssl.xunlei.com/v1/shield/captcha/init', headers: {}, postData: JSON.stringify({ device_id: '550cfe136e9d74e95be5393738639de7', meta: { package_name: 'pan.xunlei.com', client_version: '1.93.6', captcha_sign: '1.3221d0', timestamp: '1791371226120', user_id: '1367069689' } }) },
+  ],
+});
+capRes = await capReq(true);
+capBody = await capRes.json();
+check('CDP 抓取成功 → 脱敏结果（userId + captcha 身份，响应体不含 Bearer）', capRes.status === 200 && capBody.ok === true && capBody.userId === '1367069689' && capBody.hasCaptchaSign === true && capBody.deviceId === '550cfe136e9d74e95be5393738639de7' && !/Bearer/.test(JSON.stringify(capBody)), JSON.stringify(capBody));
+
+const xlStatus1 = await (await fetch(`${base}/api/xunlei/credential/status`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('status 脱敏（authorizationSet + userId，且无 authorization 明文）', xlStatus1.ok === true && xlStatus1.status?.authorizationSet === true && xlStatus1.status?.userId === '1367069689' && xlStatus1.status?.hasCaptchaSign === true && !/Bearer/.test(JSON.stringify(xlStatus1)), JSON.stringify(xlStatus1.status));
+
+const accAfter = await (await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } })).json();
+const xlAcc = accAfter.accounts?.find((a) => a.pan === 'xunlei');
+check('账号池出现 pan=xunlei 账号（label 带 userId）', Boolean(xlAcc) && /1367069689/.test(xlAcc.label ?? ''), JSON.stringify(xlAcc));
+
+// ⑩.96 v1.4.1：pan 白名单（alipan）+ 删除账号成功路径
+r = await fetch(`${base}/api/web/accounts`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, pan: 'alipan', label: 'ali-test', cookieString: 'authorization=***;drive_id=d1;to_parent_file_id=p1' }),
+});
+const aliAdd = await r.json();
+check('pan=alipan 添加账号不再报「未知网盘」（①）', r.ok && aliAdd.ok, JSON.stringify(aliAdd));
+
+const tempForDelete = await (await fetch(`${base}/api/web/accounts`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, pan: 'uc', kind: 'guest', cookieString: '', label: 'del-me' }),
+})).json();
+const delOk = await fetch(`${base}/api/web/accounts/${tempForDelete.id}`, {
+  method: 'DELETE',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken }),
+});
+const accAfterDel = await (await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('删除账号成功路径（⑤：DELETE body 里的二次令牌被解析）', delOk.status === 200 && !accAfterDel.accounts.some((a) => a.id === tempForDelete.id), `status=${delOk.status}`);
+
+// ⑩.97 v1.4.1：智能写入（按键级临时 → 到期恢复旧值，③）
+const postSettingsApi = (body) => fetch(`${base}/api/web/settings`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify(body),
+});
+const getSettingsApi = async () => (await (await fetch(`${base}/api/web/settings`, { headers: { 'x-webui-token': webuiToken } })).json());
+await postSettingsApi({ xunlei: { user_id: 'old-777' } });
+const st1 = await getSettingsApi();
+check('长期写入生效（基准值 old-777）', st1.xunlei?.userId === 'old-777', JSON.stringify(st1.xunlei));
+const smartRes = await (await postSettingsApi({ smart: { xunlei_user_id: { value: 'temp-888', ttlSeconds: 1 } } })).json();
+check('智能写入（临时）返回 temp=true', smartRes.ok === true && smartRes.applied?.[0]?.temp === true, JSON.stringify(smartRes));
+const st2 = await getSettingsApi();
+check('临时值立即生效 + 出现在 tempKeys', st2.xunlei?.userId === 'temp-888' && (st2.tempKeys ?? []).some((t) => t.key === 'xunlei_user_id'), JSON.stringify({ userId: st2.xunlei?.userId, tempKeys: st2.tempKeys }));
+await sleep(1300);
+const st3 = await getSettingsApi();
+check('临时到期 → **恢复旧值**（不是清空）', st3.xunlei?.userId === 'old-777' && (st3.tempKeys ?? []).length === 0, JSON.stringify({ userId: st3.xunlei?.userId, tempKeys: st3.tempKeys }));
+await postSettingsApi({ smart: { xunlei_user_id: { value: 'long-999' } } });
+const st4 = await getSettingsApi();
+check('手动（长期）写入清掉临时记录', st4.xunlei?.userId === 'long-999' && (st4.tempKeys ?? []).length === 0, JSON.stringify({ userId: st4.xunlei?.userId, tempKeys: st4.tempKeys }));
+
+// ⑩.98 v1.4.1：CDP port ↔ 账号绑定锁（④）
+const capOnPort = (port, extra = {}) => fetch(`${base}/api/xunlei/credential/cdp`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, port, ...extra }),
+});
+writeStub({
+  requests: [{ url: 'https://api-pan.xunlei.com/drive/v1/files/abc', headers: { authorization: fakeAuth, 'x-device-id': '550cfe136e9d74e95be5393738639de7' } }],
+});
+let cap1 = await capOnPort(9333, { force: true });
+let cap1Body = await cap1.json();
+check('指定 port 抓取 → 建立绑定（port 9333 → accountId）', cap1.status === 200 && cap1Body.port === 9333 && cap1Body.binding?.accountId === cap1Body.accountId && cap1Body.binding?.userId === '1367069689', JSON.stringify(cap1Body));
+const xlCount1 = (await (await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } })).json()).accounts.filter((a) => a.pan === 'xunlei').length;
+const cap2 = await capOnPort(9333, { force: true });
+const cap2Body = await cap2.json();
+const xlCount2 = (await (await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } })).json()).accounts.filter((a) => a.pan === 'xunlei').length;
+check('同 port 再抓 → 写回同一账号（reusedAccount，不再新建）', cap2.status === 200 && cap2Body.reusedAccount === true && cap2Body.accountId === cap1Body.accountId && xlCount2 === xlCount1, JSON.stringify({ cap2Body, xlCount1, xlCount2 }));
+
+await fetch(`${base}/api/xunlei/credential/bind`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, port: 9444, accountId: 999, userId: 'other-user' }),
+});
+const conflict = await capOnPort(9444, { force: true });
+const conflictBody = await conflict.json();
+check('port 已绑别的账号 → 409 明确冲突提示（允许 rebind）', conflict.status === 409 && conflictBody.error === 'PORT_BOUND_OTHER_ACCOUNT' && /rebind|解绑/.test(conflictBody.message ?? ''), JSON.stringify(conflictBody));
+const rebind = await capOnPort(9444, { force: true, rebind: true });
+check('rebind=true 允许改绑', rebind.status === 200, `status=${rebind.status}`);
+const bindList = await (await fetch(`${base}/api/xunlei/credential/status`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('status 回 port 绑定列表（脱敏）', Array.isArray(bindList.portBindings) && bindList.portBindings.some((b) => b.port === 9333) && !/Bearer/.test(JSON.stringify(bindList)), JSON.stringify(bindList.portBindings));
+
+// ⑩.99 v1.4.1：CDP 抓取限频（⑥：与其它驱动一致，5 分钟）
+const limited = await capOnPort(9222);
+const limitedBody = await limited.json();
+check('刚抓过 → 429 限频提示（⑥）', limited.status === 429 && limitedBody.error === 'RATE_LIMITED' && /秒后再试|限频/.test(limitedBody.message ?? ''), JSON.stringify(limitedBody));
+
+// ⑩.995 v1.4.1 遗留#1：账号凭据串的按键级临时/长期
+// 观测手段：接口层只回 hit/none（不泄值），这里直接 import cookies.js 读明文做断言（仅测试进程内）
+const cookiesMod = await import(`${BACKEND}src/cookies.js`);
+const credOf = (id) => cookiesMod.getAccount(Number(id))?.cookieString ?? '';
+const addAccountApi = (body) => fetch(`${base}/api/web/accounts`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, ...body }),
+});
+const detailApi = async (id) => (await (await fetch(`${base}/api/web/accounts/${id}`, { headers: { 'x-webui-token': webuiToken } })).json());
+
+// 建账号：__pus / __uid / __puus（均长期）
+const ktAdd = await (await addAccountApi({ pan: 'quark', label: 'kt-test', cookieString: '__pus=old-pus; __uid=uid-1; __puus=puus-1' })).json();
+const ktId = ktAdd.id;
+check('账号创建（键级临时测试基线）', Boolean(ktId) && credOf(ktId).includes('__pus=old-pus'), JSON.stringify(ktAdd));
+
+// ④ 读接口只回 hit/none（绝不回值）
+const ktDetail = await detailApi(ktId);
+check('账号详情只回 hit/none（不回凭据值）', ktDetail.keyState?.__pus === 'hit' && ktDetail.keyState?.__puus === 'hit' && !/old-pus|puus-1/.test(JSON.stringify(ktDetail)), JSON.stringify(ktDetail.keyState));
+
+// ① 键级临时立即生效（__pus 临时 1s + __puus 长期；⑤ 混合写入）
+await addAccountApi({ id: ktId, pan: 'quark', label: 'kt-test', cookieString: '__pus=new-pus; __uid=uid-1; __puus=puus-new', keyTemps: { __pus: { ttlSeconds: 1 } } });
+check('① 键级临时写入立即生效（__pus=new-pus）', credOf(ktId).includes('__pus=new-pus'), credOf(ktId));
+const ktDetail2 = await detailApi(ktId);
+check('⑤ 混合写入：__pus 有临时记录、__puus 无', (ktDetail2.tempKeys ?? []).some((t) => t.key === '__pus') && !(ktDetail2.tempKeys ?? []).some((t) => t.key === '__puus'), JSON.stringify(ktDetail2.tempKeys));
+
+// ② 到期恢复旧值（__pus 回 old-pus），长期键 __puus 保持新值
+await sleep(1300);
+await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } }); // 触发懒清扫
+const afterExpire = credOf(ktId);
+check('② 临时到期 → 恢复该键旧值（__pus=old-pus）', afterExpire.includes('__pus=old-pus'), afterExpire);
+check('⑤ 长期键不受影响（__puus=puus-new）', afterExpire.includes('__puus=puus-new'), afterExpire);
+
+// ②b 旧值不存在 → 删除该键
+await addAccountApi({ id: ktId, pan: 'quark', label: 'kt-test', cookieString: `${credOf(ktId)}; __kps=kps-temp`, keyTemps: { __kps: { ttlSeconds: 1 } } });
+check('②b 新键临时写入生效（__kps=kps-temp）', credOf(ktId).includes('__kps=kps-temp'), credOf(ktId));
+await sleep(1300);
+await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } });
+check('②b 旧值不存在 → 到期删除该键（__kps 消失）', !credOf(ktId).includes('__kps='), credOf(ktId));
+
+// ③ 手动（长期）写入清掉临时记录，且值不回退
+await addAccountApi({ id: ktId, pan: 'quark', label: 'kt-test', cookieString: `${credOf(ktId)}; __uid=temp-uid`, keyTemps: { __uid: { ttlSeconds: 2 } } });
+const ktDetail3 = await detailApi(ktId);
+check('③ 前置：__uid 已挂临时记录', (ktDetail3.tempKeys ?? []).some((t) => t.key === '__uid'), JSON.stringify(ktDetail3.tempKeys));
+await addAccountApi({ id: ktId, pan: 'quark', label: 'kt-test', cookieString: `${credOf(ktId).replace(/__uid=[^;]*/,'__uid=manual-uid')}` });
+const ktDetail4 = await detailApi(ktId);
+check('③ 手动长期写入 → 清掉该键临时记录', !(ktDetail4.tempKeys ?? []).some((t) => t.key === '__uid') && credOf(ktId).includes('__uid=manual-uid'), JSON.stringify({ tempKeys: ktDetail4.tempKeys, cred: credOf(ktId) }));
+await sleep(2300);
+await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } });
+check('③ 值不回退（manual-uid 保持）', credOf(ktId).includes('__uid=manual-uid'), credOf(ktId));
 
 // ⑪ 严格终端：未开启时 ws 应 403；开启后过滤高危命令
 r = await fetch(`${base}/api/web/settings`, {

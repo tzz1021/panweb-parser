@@ -17,7 +17,7 @@
  * - runRefreshCycle()：cookie 刷新定时器（quark 优先）——轻量登录态请求捕获 set-cookie
  *   → mergeSetCookies；连续失败 ≥3 标 expired；整体 try/catch 永不崩溃
  */
-import { getDb, encrypt, decrypt, audit } from './db.js';
+import { getDb, encrypt, decrypt, audit, upsertAccountKeyTemp, getAccountKeyTemp, listAccountKeyTemps, listExpiredAccountKeyTemps, deleteAccountKeyTemp, deleteAccountKeyTempsOf } from './db.js';
 import { log } from './log.js';
 import { randomBytes } from 'node:crypto';
 
@@ -30,6 +30,8 @@ export const PAN_KEYS = {
   uc: ['__pugs'],
   // v1.4：迅雷不是 cookie 而是「授权头 + 转存目标目录」；面板录号走同一张表（键名同凭据串）
   xunlei: ['authorization', 'to_parent_id', 'user_id'],
+  // v1.4.1：阿里云盘也是凭据串（auth/drive_id/to_parent_file_id），面板添加账号曾报「未知网盘 pan：alipan」
+  alipan: ['authorization', 'drive_id', 'to_parent_file_id'],
 };
 
 /** guest 账号只认 __pugs（游客态下载凭据，quark 小文件/UC 同机制） */
@@ -50,6 +52,86 @@ export function cookieValueOf(cookieString, key) {
 export function keysPresent(cookieString, pan, kind = 'real') {
   const keys = kind === 'guest' ? GUEST_KEYS : PAN_KEYS[pan] ?? [];
   return keys.filter((k) => Boolean(cookieValueOf(cookieString, k)));
+}
+
+/* ---------------- v1.4.1 凭据串结构编辑（按键级临时/长期；遗留#1） ---------------- */
+
+/** 凭据串 → [[k,v],...]（保序；只取首个 '=' 分割） */
+function credentialPairs(str) {
+  const out = [];
+  for (const part of String(str ?? '').split(';')) {
+    const seg = part.trim();
+    if (!seg) continue;
+    const eq = seg.indexOf('=');
+    if (eq <= 0) continue;
+    const k = seg.slice(0, eq).trim();
+    const v = seg.slice(eq + 1).trim();
+    if (k) out.push([k, v]);
+  }
+  return out;
+}
+
+function pairsToString(pairs) {
+  return pairs.map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function setPair(pairs, key, value) {
+  const i = pairs.findIndex(([k]) => k === key);
+  if (i >= 0) pairs[i][1] = value;
+  else pairs.push([key, value]);
+}
+
+function dropPair(pairs, key) {
+  const i = pairs.findIndex(([k]) => k === key);
+  if (i >= 0) pairs.splice(i, 1);
+}
+
+/** 按键级临时的 TTL 归一（支持 ttlSeconds 便于测试 / ttlMinutes 面板用） */
+function ttlMsOf(spec) {
+  const ttlSeconds = Number(spec?.ttlSeconds);
+  const ttlMinutes = Number(spec?.ttlMinutes);
+  if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) return ttlSeconds * 1000;
+  if (Number.isFinite(ttlMinutes) && ttlMinutes > 0) return ttlMinutes * 60_000;
+  return 0;
+}
+
+/** 某账号已挂的按键级临时（key + 到期时间；**不带值**） */
+export function accountTempKeys(accountId) {
+  return listAccountKeyTemps(accountId);
+}
+
+/** 某账号凭据串的键存在性（**只回 hit/none，绝不回值**） */
+export function accountKeyState(accountId) {
+  const r = getDb().prepare('SELECT pan, kind, cookie_enc FROM accounts WHERE id = ?').get(Number(accountId));
+  if (!r) return null;
+  const plain = decrypt(r.cookie_enc) ?? '';
+  const keys = (r.kind ?? 'real') === 'guest' ? GUEST_KEYS : PAN_KEYS[r.pan] ?? [];
+  const state = {};
+  for (const k of keys) state[k] = cookieValueOf(plain, k) ? 'hit' : 'none';
+  return state;
+}
+
+/**
+ * 到期清扫（按键级）：临时键恢复**旧值**（旧值不存在 → 删该键）；返回明细。
+ * 挂到现有懒清 + 5min ticker 上即可（不要求秒级）。
+ */
+export function sweepAccountKeyTemps() {
+  const rows = listExpiredAccountKeyTemps();
+  const db = getDb();
+  const out = [];
+  for (const r of rows) {
+    const acc = db.prepare('SELECT id, cookie_enc FROM accounts WHERE id = ?').get(r.account_id);
+    if (acc) {
+      const pairs = credentialPairs(decrypt(acc.cookie_enc) ?? '');
+      const prev = r.prev_value_enc ? decrypt(r.prev_value_enc) : null;
+      if (prev === null || prev === undefined) dropPair(pairs, r.key);
+      else setPair(pairs, r.key, prev);
+      db.prepare('UPDATE accounts SET cookie_enc = ?, updated_at = ? WHERE id = ?').run(encrypt(pairsToString(pairs)), Date.now(), r.account_id);
+    }
+    deleteAccountKeyTemp(r.account_id, r.key);
+    out.push({ accountId: r.account_id, key: r.key, restored: Boolean(r.prev_value_enc) });
+  }
+  return out;
 }
 
 /* ---------------- CRUD ---------------- */
@@ -78,6 +160,8 @@ export function listAccounts() {
       lastUsedAt: r.last_used_at,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
+      // v1.4.1 遗留#1：按键级临时剩余时间（key + 到期，**不带值**）
+      tempKeys: listAccountKeyTemps(r.id),
       // 凭据本体与任何指纹（长度/尾串/关键 key）都不出现在接口层
     };
   });
@@ -139,12 +223,17 @@ export function upsertAccount(fields, via = 'webui') {
   const tempExpiresAt = Number.isFinite(ttl) && ttl > 0 ? now + Math.round(ttl) * 60_000 : null;
   const enc = encrypt(cookieString);
   const db = getDb();
+  // v1.4.1：按键级临时写入需要「写入前的旧值」快照（编辑时从旧凭据串取）
+  const prevPlain = fields.id
+    ? decrypt(db.prepare('SELECT cookie_enc FROM accounts WHERE id = ?').get(Number(fields.id))?.cookie_enc) ?? ''
+    : '';
+  let accountId;
   if (fields.id) {
     db.prepare(
       'UPDATE accounts SET pan=?, label=?, cookie_enc=?, expires_at=?, temp_expires_at=?, status=?, kind=?, updated_at=? WHERE id=?',
     ).run(pan, label, enc, expiresAt, tempExpiresAt, 'ok', kind, now, fields.id);
     audit(tempExpiresAt ? 'account.temp-write' : 'account.update', `${pan}/${label}${tempExpiresAt ? `（临时 ${Math.round(ttl)} 分钟）` : ''}`, via);
-    return fields.id;
+    accountId = Number(fields.id);
   } else {
     const info = db
       .prepare(
@@ -152,9 +241,27 @@ export function upsertAccount(fields, via = 'webui') {
       )
       .run(pan, label, enc, expiresAt, tempExpiresAt, 'ok', kind, now, now);
     audit(tempExpiresAt ? 'account.temp-write' : 'account.add', `${pan}/${label}${tempExpiresAt ? `（临时 ${Math.round(ttl)} 分钟）` : ''}`, via);
-    return info.lastInsertRowid;
+    accountId = Number(info.lastInsertRowid);
   }
-  return fields.id;
+
+  // ---- v1.4.1 遗留#1：按键级临时 / 长期（手动写入优先级最高）----
+  const keyTemps = fields.keyTemps && typeof fields.keyTemps === 'object' ? fields.keyTemps : {};
+  for (const [k, spec] of Object.entries(keyTemps)) {
+    const ttlMs = ttlMsOf(spec);
+    if (ttlMs > 0) {
+      const existing = getAccountKeyTemp(accountId, k);
+      const prev = cookieValueOf(prevPlain, k);
+      // 首次临时化才快照旧值（已有记录只续期，不动 prev）
+      upsertAccountKeyTemp(accountId, k, existing ? undefined : prev === undefined ? null : encrypt(prev), now + ttlMs);
+    } else {
+      deleteAccountKeyTemp(accountId, k);
+    }
+  }
+  // 本次写入但未标「临时」的键 = 手动长期写入 → 清掉它们的临时记录（优先级最高）
+  for (const [k] of credentialPairs(cookieString)) {
+    if (!Object.prototype.hasOwnProperty.call(keyTemps, k)) deleteAccountKeyTemp(accountId, k);
+  }
+  return accountId;
 }
 
 /**
@@ -166,7 +273,10 @@ export function sweepTempAccounts() {
   const rows = getDb().prepare('SELECT id, pan, label FROM accounts WHERE temp_expires_at IS NOT NULL AND temp_expires_at <= ?').all(now);
   if (rows.length === 0) return [];
   const stmt = getDb().prepare('DELETE FROM accounts WHERE id = ?');
-  for (const r of rows) stmt.run(r.id);
+  for (const r of rows) {
+    stmt.run(r.id);
+    deleteAccountKeyTempsOf(r.id); // v1.4.1：账号级到期清除时一并清按键级临时
+  }
   return rows.map((r) => ({ id: r.id, pan: r.pan, label: r.label ?? '' }));
 }
 
@@ -175,6 +285,7 @@ export function deleteAccount(id, via = 'webui') {
   const r = getDb().prepare('SELECT * FROM accounts WHERE id = ?').get(id);
   if (r) {
     getDb().prepare('DELETE FROM accounts WHERE id = ?').run(id);
+    deleteAccountKeyTempsOf(id); // v1.4.1：连带清掉该账号的按键级临时记录
     audit('account.delete', `${r.pan}/${r.label ?? ''}`, via);
   }
 }
