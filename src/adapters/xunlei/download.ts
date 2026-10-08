@@ -53,6 +53,31 @@ export class XunleiOpError extends Error {
   }
 }
 
+/**
+ * 「断线」类错误码（v1.4 错误分类）：网络异常 / CORS / op 路由 404·405·501·502 / 非 JSON /
+ * 未配置或不可达。UI 据此弹「后端断线了。。。」专属弹窗；
+ * 其余（NO_ACCOUNT / NOT_FOUND / AUTH_EXPIRED / 上游报错）才是**业务失败**。
+ */
+export const XUNLEI_OFFLINE_CODES: ReadonlySet<string> = new Set([
+  'OFFLINE',
+  'PROXY_UNREACHABLE',
+  'NO_BACKEND',
+  'BACKEND_NOT_CONFIGURED',
+  'BACKEND_UNREACHABLE',
+  'BACKEND_BAD_RESPONSE',
+  'XUNLEI_CAPTCHA_UNAVAILABLE',
+  'METHOD_NOT_ALLOWED',
+  'OP_HTTP_404',
+  'OP_HTTP_405',
+  'OP_HTTP_501',
+  'OP_HTTP_502',
+]);
+
+/** 该错误码是否属于「断线」（UI 弹专属弹窗、中止本批） */
+export function isXunleiOfflineCode(code: unknown): boolean {
+  return typeof code === 'string' && XUNLEI_OFFLINE_CODES.has(code);
+}
+
 /* ============================== ops 调用 ============================== */
 
 /**
@@ -70,8 +95,10 @@ async function op(payload: XunleiOpPayload, step: string): Promise<NonNullable<X
   const r = await transport.xunleiOp(payload);
   const d = r.data;
   if (!r.ok || !d) {
+    // 非 JSON / 无响应体 → 归为「断线」（后端响应不可解析，UI 弹专属弹窗）
+    const code = d?.code ?? d?.error ?? (!d ? 'OFFLINE' : `OP_HTTP_${r.status}`);
     throw new XunleiOpError(
-      d?.code ?? d?.error ?? `OP_HTTP_${r.status}`,
+      code,
       `${step}失败：${d?.message ?? d?.error ?? (r.status === 0 ? '代理不可达' : `托管后端 HTTP ${r.status}`)}`,
     );
   }

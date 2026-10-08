@@ -135,7 +135,8 @@ assert('转发头不含注入的 x-captcha-token', fwdHeaders !== null && !('x-c
 globalThis.fetch = realFetch;
 
 // 15. xunlei-op 自有路由（账号相关 ops 由 backend 代发；前端只发意图）
-const { onRequestPost: opPost, onRequestOptions: opOptions } = await import('../functions/api/xunlei-op.js');
+// v1.4：路由移到嵌套目录 → 真正的 /api/xunlei/op（旧 xunlei-op.js 会变 404）
+const { onRequestPost: opPost, onRequestOptions: opOptions } = await import('../functions/api/xunlei/op.js');
 async function opCall(payload, { token = 'test-token', ip = '5.5.5.5', env = { PROXY_TOKEN: 'test-token' } } = {}) {
   const req = new Request('https://example.com/api/xunlei/op', {
     method: 'POST',
@@ -169,6 +170,23 @@ assert('op backend 非 JSON -> 502', r.status === 502 && (await r.json()).error 
 globalThis.fetch = realFetch;
 const opPre = opOptions();
 assert('op OPTIONS -> 204 + CORS', opPre.status === 204 && opPre.headers.get('access-control-allow-methods')?.includes('POST'));
+
+// 16. v1.4 op 探活 ping：透传到 backend（不打上游），且失败分支必带 CORS 头
+globalThis.fetch = async (url, init) => {
+  assert('ping 透传 backend /api/xunlei/op', String(url) === 'http://backend.test/api/xunlei/op', String(url));
+  assert('ping 请求体 op=ping', JSON.parse(init.body).op === 'ping');
+  return new Response(JSON.stringify({ ok: true, pong: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+};
+r = await opCall({ op: 'ping' }, { env: opEnv });
+const pongBody = await r.json();
+assert('ping -> 200 {ok:true}', r.status === 200 && pongBody.ok === true, JSON.stringify(pongBody));
+globalThis.fetch = realFetch;
+
+// 17. 异常兜底：handler 抛错也必须回带 CORS 头的 JSON（否则浏览器只见 CORS 错误）
+globalThis.fetch = async () => { throw new Error('boom'); };
+r = await opCall({ op: 'ping' }, { env: opEnv });
+assert('handler 内异常 -> 带 CORS 头的 JSON（非裸 500）', r.headers.get('access-control-allow-origin') === '*' && (await r.json()).error !== undefined, `status=${r.status}`);
+globalThis.fetch = realFetch;
 
 console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

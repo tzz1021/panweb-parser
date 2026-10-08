@@ -17,7 +17,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getConfig, saveConfig, randomToken, syncDevVars, uptimeMs, BACKEND_VERSION } from './config.js';
-import { initDb, getDb, audit, listAudit, listHosts, addHost, getSetting, setSetting, deleteLogsOlderThan, purgeAllLogs } from './db.js';
+import { initDb, getDb, audit, listAudit, listHosts, addHost, getSetting, setSetting, setSettingSmart, sweepTempSettings, listTempSettings, deleteLogsOlderThan, purgeAllLogs } from './db.js';
 import { log, listLogs, clearRing } from './log.js';
 import { hostAllowed, originAllowed, verifyWebuiToken, createCsrf, verifyCsrf, verifyProxyToken } from './auth.js';
 import { handleProxy } from './proxy.js';
@@ -25,15 +25,21 @@ import { getWranglerHealth } from './wrangler.js';
 import {
   captchaTokenForAction,
   clearXunleiTokenCache,
+  findXunleiAccountIdByUserId,
   runOp,
+  saveXunleiCapturedCredential,
+  xunleiCredentialStatus,
+  xunleiSetting,
   xunleiSettingsView,
   XunleiTokenConfigError,
   XunleiTokenUpstreamError,
 } from './xunlei.js';
+import { captureXunleiCredential } from './xunlei-cdp.js';
+import { bindPort, bindingOf, listPortBindings, unbindPort } from './cdp-bind.js';
 import { listPresets, runPreset, browserHealth } from './presets.js';
 import {
   listAccounts, getAccount, upsertAccount, deleteAccount, countByPan, pickAccountForPan,
-  listAccountIdentities,
+  listAccountIdentities, accountKeyState, accountTempKeys, sweepAccountKeyTemps,
   sweepTempAccounts,
 } from './cookies.js';
 import {
@@ -305,8 +311,11 @@ async function handleXunleiCaptchaToken(req, res) {
 
 /* ================= v1.4 迅雷账号相关 ops（settings/restore/rename/download） ================= */
 
-/** op 词表（与 SPA XunleiOpName / functions 路由同表） */
-const XUNLEI_OPS = ['settings', 'restore', 'rename', 'download'];
+/** op 词表（与 SPA XunleiOpName / functions 路由同表）；ping = 探活 */
+const XUNLEI_OPS = ['ping', 'settings', 'restore', 'rename', 'download'];
+
+/** v1.4.1：迅雷凭据抓取的限频（与其它驱动预设一致的 5 分钟） */
+const XUNLEI_CAPTURE_MIN_INTERVAL_MS = 5 * 60_000;
 
 /**
  * POST /api/xunlei/op（X-Proxy-Token 鉴权）—— 前端只发意图，backend 用自己的
@@ -349,6 +358,152 @@ async function handleXunleiOp(req, res) {
   }
 }
 
+/* ================= v1.4 迅雷凭据（CDP 一条龙；WebUI 鉴权 + 二次确认） ================= */
+
+/**
+ * 迅雷凭据端点（v1.4）：
+ *   GET  /api/xunlei/credential/status → 脱敏状态（**绝不回 authorization**）
+ *   POST /api/xunlei/credential/cdp    → 用 CDP 抓登录态（authorization + captcha 身份）并落库；二次确认令牌
+ * 安全口径（Tzz）：迅雷只走 CDP 取 authorization，**不存真实 cookie**；凭据不回面板。
+ */
+async function handleXunleiCredential(req, res, pathname) {
+  if (!hostAllowed(req.headers.host)) {
+    return json(res, 403, { error: 'HOST_NOT_ALLOWED', message: 'Host 头不在白名单（仅 127.0.0.1/localhost）' });
+  }
+  if (!originAllowed(req.headers.origin, req.headers.host)) {
+    return json(res, 403, { error: 'ORIGIN_NOT_ALLOWED', message: 'Origin 不在白名单（仅同源）' });
+  }
+  if (!verifyWebuiToken(req.headers['x-webui-token'] ?? '')) {
+    return json(res, 401, { error: 'UNAUTHORIZED', message: 'WebUI 令牌无效或未登录' });
+  }
+
+  if (pathname === '/api/xunlei/credential/status' && req.method === 'GET') {
+    return json(res, 200, { ok: true, status: xunleiCredentialStatus(), portBindings: listPortBindings() });
+  }
+
+  // v1.4.1：手动改绑 / 解绑（port ↔ 账号）
+  if (pathname === '/api/xunlei/credential/bind' && req.method === 'POST') {
+    if (!verifyCsrf(req.headers['x-csrf-token'] ?? '')) {
+      return json(res, 403, { error: 'CSRF_INVALID', message: 'CSRF 校验失败，请刷新页面重试' });
+    }
+    let b = {};
+    try {
+      const raw = await readBody(req);
+      b = raw ? JSON.parse(raw) : {};
+    } catch {
+      return json(res, 400, { error: 'BAD_BODY', message: '请求体必须是 JSON' });
+    }
+    if (!verifyWebuiToken(String(b?.confirmToken ?? ''))) {
+      return json(res, 403, { error: 'CONFIRM_REQUIRED', message: '修改浏览器↔账号绑定：请二次输入 WebUI 令牌' });
+    }
+    const port = Number(b?.port);
+    try {
+      if (b?.accountId === null || b?.accountId === undefined || b?.accountId === '') {
+        const r = unbindPort(port);
+        audit('xunlei.credential.bind', `port ${port} 解绑`, 'webui');
+        return json(res, 200, { ok: true, ...r });
+      }
+      const rec = bindPort({ port, accountId: Number(b.accountId), userId: b?.userId, note: b?.note });
+      audit('xunlei.credential.bind', `port ${port} → #${rec.accountId}`, 'webui');
+      return json(res, 200, { ok: true, binding: rec });
+    } catch (err) {
+      return json(res, 400, { error: 'BAD_BIND', message: err.message });
+    }
+  }
+
+  if (pathname === '/api/xunlei/credential/cdp' && req.method === 'POST') {
+    if (!verifyCsrf(req.headers['x-csrf-token'] ?? '')) {
+      return json(res, 403, { error: 'CSRF_INVALID', message: 'CSRF 校验失败，请刷新页面重试' });
+    }
+    let body = {};
+    try {
+      const raw = await readBody(req);
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      return json(res, 400, { error: 'BAD_BODY', message: '请求体必须是 JSON' });
+    }
+    if (!verifyWebuiToken(String(body?.confirmToken ?? ''))) {
+      return json(res, 403, {
+        error: 'CONFIRM_REQUIRED',
+        message: '抓取迅雷凭据会写账号池/设置：请二次输入 WebUI 令牌',
+      });
+    }
+    // v1.4.1 限频（与其它驱动预设一致）：成功抓取后 5 分钟内不再抓（body.force=true 可强制）
+    const lastCaptureAt = Number(xunleiSetting('credential_at')) || 0;
+    if (lastCaptureAt && Date.now() - lastCaptureAt < XUNLEI_CAPTURE_MIN_INTERVAL_MS && body?.force !== true) {
+      const wait = Math.ceil((XUNLEI_CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureAt)) / 1000);
+      return json(res, 429, {
+        ok: false,
+        error: 'RATE_LIMITED',
+        message: `迅雷凭据抓取限频：请 ${wait} 秒后再试（每 ${Math.round(XUNLEI_CAPTURE_MIN_INTERVAL_MS / 1000)} 秒最多一次）`,
+      });
+    }
+    const port = Number(body?.port) || 9222;
+    try {
+      const captured = await captureXunleiCredential({ port });
+      // v1.4.1 port↔账号绑定：优先写回绑定账号；再按同一 userId 兜底复用（避免一个浏览器抓成两个账号）
+      const binding = bindingOf(port);
+      if (
+        binding?.accountId &&
+        binding.userId &&
+        captured.userId &&
+        String(captured.userId) !== String(binding.userId) &&
+        body?.rebind !== true
+      ) {
+        return json(res, 409, {
+          ok: false,
+          error: 'PORT_BOUND_OTHER_ACCOUNT',
+          message: `端口 ${port} 已绑定账号 ${binding.userId}（#${binding.accountId}），但本次抓到 ${captured.userId}：请确认改绑（rebind=true），或换端口/先在面板解绑`,
+          binding,
+        });
+      }
+      const reuseId = binding?.accountId ?? findXunleiAccountIdByUserId(captured.userId);
+      const saved = saveXunleiCapturedCredential({ ...captured, toParentId: body?.toParentId, accountId: reuseId });
+      let bound = null;
+      try {
+        bound = bindPort({
+          port,
+          accountId: saved.accountId,
+          userId: saved.userId,
+          label: saved.userId ? `xunlei#${saved.userId}` : 'xunlei',
+          note: body?.note,
+        });
+      } catch {
+        /* 绑定失败不影响凭据写入 */
+      }
+      // 面板账号快照是缓存（5min）——刚写入的 xunlei 账号要立即可见
+      try {
+        refreshAccountsSnapshot();
+      } catch {
+        /* 快照刷新失败不影响写入结果 */
+      }
+      audit('xunlei.credential.cdp', `userId=${saved.userId ?? '?'}`, 'webui');
+      log('info', `xunlei：CDP 抓取凭据成功（userId=${saved.userId ?? '?'}，captchaSign=${saved.hasCaptchaSign ? '有' : '无'}）`);
+      // 脱敏返回：绝不含 authorization / cookie
+      return json(res, 200, {
+        ok: true,
+        userId: saved.userId,
+        deviceId: saved.deviceId || null,
+        expiresAt: saved.expiresAt,
+        hasCaptchaSign: saved.hasCaptchaSign,
+        accountId: saved.accountId,
+        port,
+        reusedAccount: Boolean(reuseId),
+        binding: bound,
+        note: saved.userId ? null : '未能从 JWT 解出 user_id（已尝试 captcha meta 兜底，仍为空）',
+      });
+    } catch (err) {
+      const code = err?.code ?? 'CDP_ERROR';
+      const status = code === 'CDP_UNAVAILABLE' ? 503 : code === 'NOT_LOGGED_IN' ? 409 : code === 'TIMEOUT' ? 504 : 500;
+      audit('xunlei.credential.cdp.fail', String(code), 'webui');
+      log('warn', `xunlei：CDP 抓取凭据失败（${code}）${err?.message ? ` — ${err.message}` : ''}`);
+      return json(res, status, { ok: false, error: code, message: err?.message ?? '抓取失败' });
+    }
+  }
+
+  return json(res, 405, { error: 'METHOD_NOT_ALLOWED', message: '仅 GET /api/xunlei/credential/status 与 POST /api/xunlei/credential/cdp' });
+}
+
 /* ================= webui API 路由 ================= */
 
 /**
@@ -384,6 +539,24 @@ function startAccountsTicker() {
       if (accountsSnap.data) refreshAccountsSnapshot();
     } catch (err) {
       log('warn', `临时账号清扫失败：${err.message}`);
+    }
+    // v1.4.1：按键级临时写入到期 → 恢复旧值（智能写入）
+    try {
+      for (const r of sweepTempSettings()) {
+        audit('settings.temp-expired', `${r.key}（临时写入到期，${r.restored ? '已恢复旧值' : '旧值不存在已删键'}）`, 'backend');
+        log('info', `settings：临时写入到期 ${r.key} → ${r.restored ? '恢复旧值' : '删键'}`);
+      }
+    } catch (err) {
+      log('warn', `临时设置清扫失败：${err.message}`);
+    }
+    // v1.4.1 遗留#1：账号凭据串的按键级临时到期 → 恢复该键旧值（旧值不存在则删该键）
+    try {
+      for (const r of sweepAccountKeyTemps()) {
+        audit('account.key-temp-expired', `#${r.accountId} ${r.key}（${r.restored ? '已恢复旧值' : '旧值不存在已删键'}）`, 'backend');
+        log('info', `账号池：按键级临时到期 #${r.accountId} ${r.key} → ${r.restored ? '恢复旧值' : '删键'}`);
+      }
+    } catch (err) {
+      log('warn', `按键级临时清扫失败：${err.message}`);
     }
   };
   tick();
@@ -605,6 +778,12 @@ async function handleWebApi(req, res, pathname, body) {
   // 读：只给**服务端快照**（5min 自动刷新 + 写后即刷），字段白名单在 listAccounts（无凭据、无指纹）
   // 写：POST/DELETE 都要求**二次确认令牌**（body.confirmToken，服务端真校验，不只是前端拦）
   if (pathname === '/api/web/accounts' && req.method === 'GET') {
+    // v1.4.1：先懒清扫（按键级临时到期 → 恢复旧值），面板秒见生效值
+    try {
+      sweepAccountKeyTemps();
+    } catch {
+      /* 清扫失败不影响读 */
+    }
     const snap = accountsSnapshot();
     return send(200, { ...snap.data, snapshotAt: snap.at });
   }
@@ -640,7 +819,13 @@ async function handleWebApi(req, res, pathname, body) {
     const id = Number(pathname.split('/')[4]);
     const a = accountsSnapshot().data.accounts.find((x) => x.id === id);
     if (!a) return send(404, { error: 'NOT_FOUND' });
-    return send(200, { account: a, credentialRefillable: false });
+    // v1.4.1：凭据不回显，只回 hit/none + 按键级临时剩余时间（不带值）
+    return send(200, {
+      account: a,
+      credentialRefillable: false,
+      keyState: accountKeyState(id),
+      tempKeys: accountTempKeys(id),
+    });
   }
   if (pathname.startsWith('/api/web/accounts/') && req.method === 'DELETE') {
     if (!verifyWebuiToken(String(body?.confirmToken ?? ''))) {
@@ -688,6 +873,12 @@ async function handleWebApi(req, res, pathname, body) {
 
   // ---- 系统配置（高级：严格终端穿透 + devtools 绑定；日志保留期；校验策略说明） ----
   if (pathname === '/api/web/settings' && req.method === 'GET') {
+    // v1.4.1：读前懒清扫（到期临时写入 → 恢复旧值），面板永远看到当前生效值
+    try {
+      sweepTempSettings();
+    } catch {
+      /* 清扫失败不影响读设置 */
+    }
     return send(200, {
       notify: cfg.notify,
       advanced: cfg.advanced,
@@ -697,6 +888,8 @@ async function handleWebApi(req, res, pathname, body) {
       traceFileDetail: String(getSetting('trace_file_detail') ?? 'full'),
       // v1.4 迅雷 restore/download：web 身份 captcha 设置（sign 只回脱敏视图）
       xunlei: xunleiSettingsView(),
+      // v1.4.1 智能写入：当前挂着的按键级临时写入（到期自动恢复旧值）
+      tempKeys: listTempSettings(),
       // 只读说明：白名单/限频在 functions/api/proxy.js（单一实现），backend 不重复维护
       policy: { whitelist: 'functions/api/proxy.js → ALLOWED_HOST_SUFFIXES', rateLimit: 'proxy.js 内置 120/min/IP（v1.3.2 从 60 放宽）', owner: 'proxy.js' },
     });
@@ -748,6 +941,30 @@ async function handleWebApi(req, res, pathname, body) {
       if (changedSign) clearXunleiTokenCache(); // 滚动更新后旧 token 不再复用
       audit('settings.xunlei', `迅雷 captcha 设置更新（sign ${changedSign ? '已变更' : '未变'}）`, 'webui');
       log('info', `settings：迅雷 captcha 设置更新（sign ${changedSign ? '已变更' : '未变'}）`);
+    }
+    // v1.4.1 智能写入（批量形式）：`smart: { <key>: { value, ttlMinutes?, ttlSeconds? } }`
+    if (b.smart !== undefined && typeof b.smart === 'object') {
+      const applied = [];
+      for (const [key, spec] of Object.entries(b.smart)) {
+        const value = String(spec?.value ?? '');
+        const ttlMinutes = Number(spec?.ttlMinutes);
+        const ttlSeconds = Number(spec?.ttlSeconds);
+        const ttlMs =
+          Number.isFinite(ttlSeconds) && ttlSeconds > 0
+            ? ttlSeconds * 1000
+            : Number.isFinite(ttlMinutes) && ttlMinutes > 0
+              ? ttlMinutes * 60_000
+              : 0;
+        try {
+          const r = setSettingSmart(key, value, ttlMs);
+          applied.push({ key: r.key, temp: r.temp, expiresAt: r.expiresAt });
+          audit('settings.smart', `${key} → ${r.temp ? `临时（${Math.round(ttlMs / 1000)}s，到期恢复旧值）` : '长期'}`, 'webui');
+        } catch (err) {
+          return send(400, { error: 'BAD_SMART', message: `智能写入 ${key} 失败：${err.message}` });
+        }
+      }
+      log('info', `settings：智能写入 ${applied.length} 个键`);
+      return send(200, { ok: true, applied });
     }
     saveConfig();
     return send(200, { ok: true });
@@ -917,10 +1134,20 @@ export async function startServers() {
       if (pathname === '/api/xunlei/op') {
         return await handleXunleiOp(req, res);
       }
+      // v1.4 迅雷凭据（CDP 一条龙；面板触发）+ v1.4.1 手动改绑
+      if (
+        pathname === '/api/xunlei/credential/cdp' ||
+        pathname === '/api/xunlei/credential/status' ||
+        pathname === '/api/xunlei/credential/bind'
+      ) {
+        return await handleXunleiCredential(req, res, pathname);
+      }
       // webui API
       if (pathname.startsWith('/api/web/')) {
         let body = {};
-        if (req.method === 'POST' || req.method === 'PUT') {
+        // v1.4.1 修：DELETE 也要读 body —— 前端把二次确认令牌放在 JSON body 里，
+        // 之前只解析 POST/PUT，导致「输入了令牌也删不掉」（服务端拿到 confirmToken=空 → 403）
+        if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE' || req.method === 'PATCH') {
           const raw = await readBody(req);
           try {
             body = raw ? JSON.parse(raw) : {};

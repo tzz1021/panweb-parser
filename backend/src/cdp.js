@@ -35,8 +35,14 @@ export async function probeCdp(port = DEFAULT_CDP_PORT, timeoutMs = 1200) {
   }
 }
 
-/** 打开一个 CDP 会话（连到首个 page target；没有页面就新建一个 about:blank） */
-async function openPageSession(port, timeoutMs = 5000) {
+/**
+ * 打开一个 CDP 会话（连到首个 page target；没有页面就新建一个 about:blank）。
+ * v1.4：导出供 xunlei-cdp.js 复用（同一套「连一次、干一件事、断开」原语）。
+ * @param {number} port CDP 端口
+ * @param {number} timeoutMs 连接超时
+ * @param {(msg:object)=>void} [onEvent] 事件回调（无 id 的 CDP 事件，如 Network.requestWillBeSent）
+ */
+export async function openPageSession(port, timeoutMs = 5000, onEvent = null) {
   const base = `http://127.0.0.1:${port}`;
   const list = await (await fetch(`${base}/json/list`)).json();
   const pages = Array.isArray(list) ? list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl) : [];
@@ -72,7 +78,17 @@ async function openPageSession(port, timeoutMs = 5000) {
       return;
     }
     const p = pending.get(msg.id);
-    if (!p) return;
+    if (!p) {
+      // v1.4：无 id = CDP 事件（如 Network.requestWillBeSent）→ 交给 onEvent 消费者
+      if (!msg.id && typeof onEvent === 'function') {
+        try {
+          onEvent(msg);
+        } catch {
+          /* 事件回调异常不影响会话 */
+        }
+      }
+      return;
+    }
     pending.delete(msg.id);
     if (msg.error) p.reject(new Error(`${msg.error.message ?? 'CDP 错误'}（${msg.error.code ?? '?'}）`));
     else p.resolve(msg.result);
@@ -84,6 +100,26 @@ async function openPageSession(port, timeoutMs = 5000) {
       ws.send(JSON.stringify({ id, method, params }));
     });
   return { ws, send };
+}
+
+/**
+ * 读取浏览器**全部** cookie（CDP `Network.getAllCookies`；含 HttpOnly —— `document.cookie` 看不到）。
+ * v1.4.1：quark/uc 预设用它抓全量 cookie（不再按「取前 N 个」截断）。
+ * @returns {Promise<Array<{name:string,value:string,domain?:string,path?:string,expires?:number,secure?:boolean,httpOnly?:boolean}>>}
+ */
+export async function getAllCookies({ port = DEFAULT_CDP_PORT, timeoutMs = 5000 } = {}) {
+  const { ws, send } = await openPageSession(port, timeoutMs);
+  try {
+    await send('Network.enable');
+    const res = await send('Network.getAllCookies');
+    return Array.isArray(res?.cookies) ? res.cookies : [];
+  } finally {
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /**

@@ -16,7 +16,7 @@
  * - 插件推荐：get cookies.txt locally（chrome/edge/safari）+ 本机插件模式 / 自建代理
  * - 自建代理不显示时排查话术（账号状态 + 代理面板登录态）
  */
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import type { CookieInputRequirement } from '../adapters/types';
 import { getLastProxyAccountLabel } from '../core/transport/types';
@@ -207,6 +207,26 @@ export function CookieInputModal({
     }
   };
 
+  /**
+   * v1.4.1：**粘贴即解析**（Netscape / JSON / header string 都自动生效），不再要求先按导入按钮；
+   * 实时性靠 300ms debounce；同一文本只自动解析一次；失败保持静默（手动按钮才报错）。
+   */
+  const lastAutoParsed = useRef('');
+  useEffect(() => {
+    const text = pasteText.trim();
+    if (!text || text === lastAutoParsed.current) return;
+    const timer = setTimeout(() => {
+      lastAutoParsed.current = text;
+      try {
+        applyParsed(parseCookieText(text));
+      } catch {
+        // 不是 cookie 文本：静默（用户点导入按钮时才提示具体错误）
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pasteText]);
+
   /** 选择文件导入（.txt / .json，Netscape 导出文件最常见） */
   const handleFile = async (file: File | undefined): Promise<void> => {
     if (!file) return;
@@ -269,7 +289,7 @@ export function CookieInputModal({
               代理托管账号：<strong>{proxyAccount}</strong>
               <span style={{ color: 'var(--text-faint)' }}>（cookie 由代理托管，不在此显示明文）</span>
               <span style={{ display: 'block', marginTop: 2, color: 'var(--text-faint)' }}>
-                此处填写的 cookie 仅在直连模式生效。
+                此处填写的 cookie 优先级高于后端方便应急使用。
               </span>
             </p>
           )}

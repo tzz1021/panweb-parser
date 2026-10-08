@@ -18,8 +18,9 @@
  *   默认值是常见形态。取不到时按失败回报并提示「请在 backend/data/period/config.json 的
  *   browser.presetProbes.<id> 里填写实际取值」，不猜、不硬闯。
  */
-import { evaluateOnPage, probeCdp, DEFAULT_CDP_PORT } from './cdp.js';
+import { evaluateOnPage, probeCdp, getAllCookies, DEFAULT_CDP_PORT } from './cdp.js';
 import { upsertAccount, accountIdentity, getAccount } from './cookies.js';
+import { buildNetscape, parseCookieText, cookieStringFrom } from './cookie-text.js';
 import { getConfig } from './config.js';
 import { audit } from './db.js';
 import { log } from './log.js';
@@ -56,7 +57,7 @@ export const PRESETS = [
     title: '阿里云盘 · 刷新凭据',
     pan: 'alipan',
     url: 'https://www.alipan.com/drive/file/all',
-    desc: '打开阿里云盘网页（已登录的浏览器实例）→ 等页面自己下发新的 access_token → 读出 Authorization 写回账号池',
+    desc: '打开阿里云盘网页→ 读出 Authorization 写回账号池',
     minIntervalMs: 5 * 60_000,
     settleMs: 7000,
     // 阿里 web 端 token 常见落点（找不到时按失败回报，不猜）
@@ -85,7 +86,7 @@ export const PRESETS = [
     desc: '打开夸克网盘网页 → 读出当前登录 cookie 整串（__pus/__uid/__puus）→ 写回账号池',
     minIntervalMs: 5 * 60_000,
     settleMs: 6000,
-    probes: { storageKeys: [], cookieNames: ['__pus', '__uid', '__puus'] },
+    probes: { storageKeys: [], cookieNames: ['__pus', '__uid', '__puus', '__sdid', '__kp', '__kps', '__ktd', '_UP_A4A_11_'] },
     pick(payload) {
       return payload?.cookie || null;
     },
@@ -95,10 +96,10 @@ export const PRESETS = [
     title: 'UC 网盘 · 刷新 __pugs',
     pan: 'uc',
     url: 'https://drive.uc.cn/',
-    desc: '打开 UC 网盘页面 → 读出下载层凭据 __pugs → 写回账号池',
+    desc: '打开 UC 网盘页面 → 读出当前登录 cookie 整串（__pus/__uid/__puus） → 写回账号池',
     minIntervalMs: 5 * 60_000,
     settleMs: 6000,
-    probes: { storageKeys: [], cookieNames: ['__pugs'] },
+    probes: { storageKeys: [], cookieNames: ['__pus', '__uid', '__puus', '__sdid'] },
     pick(payload) {
       return payload?.cookie || null;
     },
@@ -183,6 +184,25 @@ export async function runPreset(id, via = 'webui') {
       settleMs: preset.settleMs,
       reload: true,
     });
+    // v1.4.1：cookie 类预设 —— 再用 CDP 抓**全量** cookie（含 HttpOnly）→ Netscape → 统一解析（不截断）
+    if (preset.probes?.cookieNames?.length) {
+      try {
+        const cookies = await getAllCookies({ port: cdpPort });
+        const netscape = buildNetscape(cookies);
+        const parsed = parseCookieText(netscape);
+        const cookie = cookieStringFrom(parsed, preset.probes.cookieNames);
+        if (cookie) {
+          payload.cookies = cookies;
+          payload.netscape = netscape;
+          payload.parsed = parsed;
+          payload.cookie = cookie;
+        }
+      } catch (err) {
+        // 抓全量失败不致命：回落 evaluateOnPage 的 document.cookie 结果（但会记一条提示）
+        runtime.set(id, { ...stateOf(id), lastMessage: `全量 cookie 抓取失败，已回落页面 document.cookie：${err?.message ?? err}` });
+        log('warn', `预设 ${id}：全量 cookie 抓取失败（${err?.message ?? err}），回落页面 document.cookie`);
+      }
+    }
     const credential = preset.pick(payload);
     if (!credential) {
       const msg = `没读到凭据（页面结构可能变了）：请在 config.json 的 browser.presetProbes.${id} 填写实际取值键（当前探测：${JSON.stringify(preset.probes)}）`;

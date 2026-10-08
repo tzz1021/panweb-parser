@@ -107,8 +107,8 @@ export const CREDENTIAL_PICK_PATH = '/api/credential-pick';
  */
 export const XUNLEI_OP_PATH = '/api/xunlei/op';
 
-/** ops 名（与 backend `runOp` 同一词表） */
-export type XunleiOpName = 'settings' | 'restore' | 'rename' | 'download';
+/** ops 名（与 backend `runOp` 同一词表）；ping = 端点探活 */
+export type XunleiOpName = 'ping' | 'settings' | 'restore' | 'rename' | 'download';
 
 /** 发给 /api/xunlei/op 的请求体（前端只发意图，不带凭据/头） */
 export interface XunleiOpPayload {

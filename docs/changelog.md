@@ -3,6 +3,37 @@
 > 面向开发者（repo:/dev/ 入口）。面向用户的说明见 README.md。
 > 约定：`## [版本] 日期` + 三块（新增 / 修复 / 变更）。
 
+## [1.4.1] 2026-10-08 —— 后端与面板修复批次（凭据参数 / 智能写入 / CDP 绑定）+ SPA 两处修正
+
+> 状态：**已实现待审**（未 commit / 未 push；tag 建议 `1.4.1`）。
+> 背景：前台 SPA 已先推送；本批以后端/webui 为主，SPA 另修两处（proxy 凭据、粘贴即解析）。
+
+### 新增
+- **面板「添加/编辑账号」特别参数手填**：xunlei → `to_parent_id` / `user_id` / `captcha_sign` / `captcha_timestamp` / `device_id`（落 `xunlei_*` 设置，与 CDP 抓取同源）；
+  alipan → `drive_id` / `to_parent_file_id`（落凭据串，与 `PAN_KEYS.alipan` 同源）。补上「CDP 只能抓 auth、抓不到转存参数」的缺口。
+- **「智能写入」**：
+  - **设置键**：按键级临时/长期（`setting_temps(k, prev_v, expires_at)` + `setSettingSmart/sweepTempSettings`），到期**恢复旧值**（不是清空）；手动（长期）写入清掉该键临时记录。
+  - **账号凭据串的键**（与设置键同族语义）：新表 `account_key_temps(account_id, key, prev_value_enc, expires_at)`（快照值同 AES 加密）；
+    `POST /api/web/accounts` 支持 `keyTemps: { "__pus": { ttlMinutes: 120 } }`（不标=长期）；到期**恢复该键旧值**、旧值不存在则删键；
+    未标临时的键=**手动长期写入**（清掉该键临时记录且不回退）；账号详情只回 `keyState: hit|none` + `tempKeys`（key+到期，**不带值**）；
+    账号级 `temp_expires_at` 保留共存（账号级到期连带清其按键级记录）。面板：检测到的每个键一行「长期/临时 + 分钟」，列表显示临时剩余（脱敏）。
+  - 清扫：读接口懒清 + **5 分钟 ticker**（非秒级）。
+- **CDP 浏览器 ↔ 账号绑定**（`backend/src/cdp-bind.js`，JSON 记录含 `port/accountId/userId/label/note/updatedAt`）：同 port 再抓**写回同一账号**（不再新建第二个号），冲突 409 + 允许 `rebind`；面板可**手动输入 port** 并查看绑定列表。
+- **后端新增 `cookie-text.js`**（`parseCookieText / buildNetscape / cookieStringFrom`，与 SPA `adapters/quark/cookies.ts` 同语义）+ **CDP `getAllCookies()`**（`Network.getAllCookies`，含 HttpOnly）+ 面板侧同构解析器。
+
+### 修复
+- **面板添加账号报「未知网盘 pan：alipan（支持 quark/uc/xunlei）」** → `PAN_KEYS.alipan` 与 `addHost` 白名单补 alipan。
+- **账号管理「删除」按钮失效**（输入后台令牌也删不掉）→ 根因：服务端**只在 POST/PUT 时读 body**，DELETE/PATCH 的二次确认令牌被丢弃 → 现在四种方法都解析 body，服务端真校验。
+- **凭据识别名不副实**：面板/前台都只认 header string，且「已检测到…」要按 Ctrl+F → 现支持 **Netscape / JSON / header**，且**输入即实时检测**（300ms debounce）。
+- **CDP 抓取探针数量不足** → 改按 **Netscape 全量**抓取（键白名单扩到 `__pus/__uid/__puus/__sdid/__kp/__kps/__ktd/_UP_A4A_11_` 等），失败回落 `document.cookie` 并记日志。
+- `Plugins.jsx`：xunlei 驱动**补 5 分钟限频**（`force` 可跳过，用于改绑/排障），按钮与其它驱动统一。
+- **SPA：proxy 模式下本地显式粘贴的夸克凭据不再被丢弃**（旧逻辑 `inProxyMode` 直接置空，导致「杀掉 backend、只用 wrangler 独立代理」时前台填的 cookie 不进请求）。
+- **SPA：粘贴框改「粘贴即自动解析」**（Netscape / JSON / header string 贴进去直接填入并实时显示检测结果，不再需要先点导入按钮）。
+
+### 变更
+- xunlei 特别参数落 `settings`、alipan 落凭据串（两者各与其已有同源，不新开第二套）。
+- 未改 CDP 抓取自身行为（仅新增 `getAllCookies` 原语）；真机 CDP 与面板交互仍待人工核。
+
 ## [1.4] 2026-10-03 —— 迅雷云盘适配器（第四个驱动）
 
 > 状态：**已实现待审**（未 commit / 未 push）。逆向依据与全部真机证据见 `docs/reverse-notes-xunlei.md`；

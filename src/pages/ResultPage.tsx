@@ -27,6 +27,7 @@ import { CheckColorPicker } from '../components/CheckColorPicker';
 import { useToast } from '../components/Toast';
 import { fetchLinks } from '../core/linkFetcher';
 import { getActiveTransport, getLastProxyAccountLabel, getLastProxyBackendOk } from '../core/transport/types';
+import { isXunleiOfflineCode } from '../adapters/xunlei/download';
 import { fetchListSnapshot, renderTreeText, hhmmss } from '../core/listFetcher';
 import { getPreferences, subscribePreferences } from '../core/preferences';
 import { addRecord } from '../core/footprint/records';
@@ -399,7 +400,25 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
     if (fetching) return;
     // v1.4 迅雷：先弹「取链方案」选择（自动/CONSUME/PLAY），选定后本批次全部文件用该 usage；批量只弹一次
     if (adapter.id === 'xunlei') {
-      setUsageChoice({ files });
+      // v1.4：先探活 op 端点（POST {op:'ping'}，backend 直接回 {ok:true}，不碰上游）。
+      // 探测失败（网络异常/CORS/404/405/501/502/非 JSON）→ 立即弹「后端断线了。。。」并**中止本批**，
+      // 不逐文件失败、不出「单文件解析失败」。
+      void (async () => {
+        const t = getActiveTransport();
+        let pong = false;
+        try {
+          const r = t.xunleiOp ? await t.xunleiOp({ op: 'ping' }) : null;
+          pong = Boolean(r && r.ok && r.data?.ok === true);
+        } catch {
+          pong = false;
+        }
+        if (!pong) {
+          setBackendDown(true);
+          toast('后端断线了：取链端点探测失败，请检查代理地址/后台是否在线', 'error');
+          return;
+        }
+        setUsageChoice({ files });
+      })();
       return;
     }
     pendingFetch.current = files;
@@ -497,20 +516,9 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
           },
         );
         addGlobalLog(`prase：接口完成 — ${results.filter((r) => r.ok).length}/${toFetch.length} 成功`);
-        // v1.4 后端断线：op 返回 NO_BACKEND / 405 / 501 / 502 等 → 专属弹窗（一次，不逐文件弹）
-        const OFFLINE_CODES = new Set([
-          'NO_BACKEND',
-          'BACKEND_NOT_CONFIGURED',
-          'BACKEND_UNREACHABLE',
-          'BACKEND_BAD_RESPONSE',
-          'XUNLEI_CAPTCHA_UNAVAILABLE',
-          'METHOD_NOT_ALLOWED',
-          'OP_HTTP_405',
-          'OP_HTTP_501',
-          'OP_HTTP_502',
-        ]);
-        backendDownDetected =
-          adapter.id === 'xunlei' && results.some((r) => !r.ok && r.errorCode !== undefined && OFFLINE_CODES.has(String(r.errorCode)));
+        // v1.4 后端断线：op 路由 404/405/501/502、网络/CORS、非 JSON、未配置等 →
+        // 专属弹窗（一次，不逐文件弹）。分类集中到适配器的 isXunleiOfflineCode。
+        backendDownDetected = adapter.id === 'xunlei' && results.some((r) => !r.ok && isXunleiOfflineCode(r.errorCode));
         if (backendDownDetected) {
           setBackendDown(true);
           toast('后端断线了：无法自动取链，请手动转存后自行选择 CONSUME / PLAY 方式取链（见 docs/xunlei-dl-choices.md）', 'error');

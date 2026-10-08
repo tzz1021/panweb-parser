@@ -280,10 +280,13 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
   // 不注入登录态整串（否则夸克返回登录态 CDN 直链、导出却配 __pugs → 下载掐断），
   // 改用捕获/随机 __pugs 模拟游客（无则不带，让响应下发新的）；默认模式才用登录整串。
   const guestMode = Boolean(params.guestMode);
-  // v1.2.2 微调：代理托管模式（selfhost）下登录态 cookie 由 backend 账号池注入（hop 合并 SPA 头），
-  // 前端 localStorage 整串不再复用（避免双份 cookie 源 + 拿不到新 set-cookie）；直连模式保持原行为
+  // v1.2.2 微调：代理托管模式（selfhost）下登录态 cookie 默认由 backend 账号池注入（hop 合并 SPA 头）；
+  // v1.4.1 修正：代理模式下**本地显式粘贴的凭据也要生效**——
+  // Tzz 实测：杀掉 backend、只用 wrangler 独立代理时，前台填的整串 cookie 根本没进请求（被这里置空）；
+  // 后端命中账号池时仍按其回传头合并，不冲突。guestMode（游客模拟）仍不带登录整串。
   const inProxyMode = getActiveTransport().id === 'proxy';
-  const loginCookie = guestMode || inProxyMode ? '' : getQuarkCookieString();
+  const localCookie = getQuarkCookieString();
+  const loginCookie = guestMode ? '' : localCookie;
   const guestPugs = guestMode && !inProxyMode ? (getQuarkPugs() ?? '') : '';
   const requestCookie = loginCookie || (guestPugs ? `__pugs=${guestPugs}` : '');
   const { data } = await request<QuarkDownloadItem[]>(

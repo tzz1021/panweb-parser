@@ -26,32 +26,44 @@ export interface KoulingResult {
 }
 
 /**
- * 口令文字 → 分享链接；失败（HTTP 非 2xx / 无 share_page / location 解析不出）返回 null。
- * 不抛错（调用方统一提示「口令不存在」）。
+ * 口令解析结果（v1.4 错误分类）：
+ * - `ok:true` → 拿到分享链接
+ * - `ok:false, reason:'offline'` → **请求层失败**（网络异常 / CORS / 非 2xx / 非 JSON）→ UI 弹「后端断线了。。。」
+ * - `ok:false, reason:'not-found'` → HTTP 2xx + JSON 解析成功，但 `ext.kouling_type !== 'share_page'`
+ *   （或 location 解析不出）→ 才是真的「口令不存在」
  */
-export async function resolveKouling(word: string): Promise<KoulingResult | null> {
+export type KoulingOutcome =
+  | ({ ok: true } & KoulingResult)
+  | { ok: false; reason: 'offline' | 'not-found' };
+
+/**
+ * 口令文字 → 分享链接。
+ * 注意：location 里的 `&` 在 JSON 里是 `\u0026`，**必须先 JSON.parse 再取字段**（不能拿正则扫原文）。
+ */
+export async function resolveKouling(word: string): Promise<KoulingOutcome> {
   const wd = String(word ?? '').trim();
-  if (!wd) return null;
+  if (!wd) return { ok: false, reason: 'not-found' };
   const url = `${KOULING_ENDPOINT}?noredirect=1&t=10&wd=${encodeURIComponent(wd)}`;
   let res: { status: number; body: string };
   try {
     res = await getActiveTransport().request({ url, method: 'GET', headers: { accept: 'application/json, text/plain, */*' } });
   } catch {
-    return null;
+    // 网络异常 / CORS：请求根本没出去（或没回来）
+    return { ok: false, reason: 'offline' };
   }
-  if (res.status < 200 || res.status >= 300) return null;
+  if (res.status < 200 || res.status >= 300) return { ok: false, reason: 'offline' };
   let data: { ext?: { kouling_type?: string; kouling_word?: string }; location?: unknown } | null = null;
   try {
     data = JSON.parse(res.body) as { ext?: { kouling_type?: string; kouling_word?: string }; location?: unknown };
   } catch {
-    return null;
+    return { ok: false, reason: 'offline' }; // 非 JSON：视作后端链路异常
   }
-  if (!data || typeof data !== 'object') return null;
-  if (data.ext?.kouling_type !== 'share_page') return null;
+  if (!data || typeof data !== 'object') return { ok: false, reason: 'offline' };
+  if (data.ext?.kouling_type !== 'share_page') return { ok: false, reason: 'not-found' };
   const location = typeof data.location === 'string' ? data.location : '';
   const m = /https?:\/\/(?:[a-z0-9-]+\.)*pan\.xunlei\.com\/s\/([A-Za-z0-9_-]+)([^\s"'<>]*)/i.exec(location);
-  if (!m) return null;
+  if (!m) return { ok: false, reason: 'not-found' };
   const shareId = m[1];
   const pwd = /[?&]pwd=([A-Za-z0-9]{4,8})/i.exec(m[2] ?? '')?.[1];
-  return { url: `https://pan.xunlei.com/s/${shareId}${pwd ? `?pwd=${pwd}` : ''}`, shareId, passcode: pwd };
+  return { ok: true, url: `https://pan.xunlei.com/s/${shareId}${pwd ? `?pwd=${pwd}` : ''}`, shareId, passcode: pwd };
 }

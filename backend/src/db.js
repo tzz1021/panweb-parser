@@ -110,6 +110,20 @@ export function initDb() {
     CREATE INDEX IF NOT EXISTS idx_fh_md5 ON file_hits(md5);
     CREATE INDEX IF NOT EXISTS idx_fh_ts  ON file_hits(ts);
     CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
+    -- v1.4.1 智能写入：按键级临时写入的**旧值快照**（到期恢复旧值，不是清空）
+    CREATE TABLE IF NOT EXISTS setting_temps (
+      k TEXT PRIMARY KEY,
+      prev_v TEXT,
+      expires_at INTEGER
+    );
+    -- v1.4.1 遗留#1：账号凭据串内部的**按键级**临时写入（值同样 AES 加密；到期恢复旧值/删键）
+    CREATE TABLE IF NOT EXISTS account_key_temps (
+      account_id INTEGER NOT NULL,
+      key TEXT NOT NULL,
+      prev_value_enc TEXT,
+      expires_at INTEGER,
+      PRIMARY KEY (account_id, key)
+    );
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY,
       ts INTEGER,
@@ -171,6 +185,100 @@ export function setSetting(key, value) {
   getDb().prepare('INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(key, String(value));
 }
 
+/* ---------------- v1.4.1 智能写入：按键级「临时/长期」+ 到期恢复旧值 ---------------- */
+
+/**
+ * 智能写入单个设置键。
+ * - `ttlMs > 0`：临时写入 —— 首次写入时 **快照当前值**，到期由 `sweepTempSettings()` **恢复旧值**
+ *   （不是清空；旧值本就不存在时才删键）；重复写入同一键只续期、不覆盖快照。
+ * - `ttlMs <= 0`：长期写入（**手动写入优先级最高**）—— 写值并**清掉该键的临时记录**。
+ * @returns {{key:string, temp:boolean, expiresAt:number|null, restoredFrom:string|null}}
+ */
+export function setSettingSmart(key, value, ttlMs = 0) {
+  const k = String(key ?? '').trim();
+  if (!k) throw new Error('设置键不能为空');
+  const db = getDb();
+  if (Number(ttlMs) > 0) {
+    const cur = getSetting(k);
+    const existing = db.prepare('SELECT k, prev_v FROM setting_temps WHERE k = ?').get(k);
+    const expiresAt = Date.now() + Number(ttlMs);
+    if (!existing) {
+      db.prepare('INSERT INTO setting_temps (k, prev_v, expires_at) VALUES (?,?,?)').run(k, cur === null ? null : String(cur), expiresAt);
+    } else {
+      db.prepare('UPDATE setting_temps SET expires_at = ? WHERE k = ?').run(expiresAt, k);
+    }
+    setSetting(k, value);
+    return { key: k, temp: true, expiresAt, restoredFrom: existing ? existing.prev_v : (cur === null ? null : String(cur)) };
+  }
+  setSetting(k, value);
+  const before = db.prepare('SELECT prev_v FROM setting_temps WHERE k = ?').get(k);
+  db.prepare('DELETE FROM setting_temps WHERE k = ?').run(k);
+  return { key: k, temp: false, expiresAt: null, restoredFrom: before?.prev_v ?? null };
+}
+
+/** 到期临时写入清扫：**恢复旧值**（旧值不存在则删键）；返回本次处理明细 */
+export function sweepTempSettings() {
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM setting_temps WHERE expires_at <= ?').all(Date.now());
+  for (const r of rows) {
+    if (r.prev_v === null || r.prev_v === undefined) db.prepare('DELETE FROM settings WHERE k = ?').run(r.k);
+    else db.prepare('INSERT INTO settings (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(r.k, r.prev_v);
+    db.prepare('DELETE FROM setting_temps WHERE k = ?').run(r.k);
+  }
+  return rows.map((r) => ({ key: r.k, restored: r.prev_v !== null && r.prev_v !== undefined }));
+}
+
+/** 当前挂着的临时写入（面板显示 + 测试断言） */
+export function listTempSettings() {
+  return getDb()
+    .prepare('SELECT k, expires_at FROM setting_temps ORDER BY expires_at')
+    .all()
+    .map((r) => ({ key: r.k, expiresAt: r.expires_at }));
+}
+
+/* ---------------- v1.4.1 账号凭据串的按键级临时（遗留#1） ---------------- */
+
+/** 写/更新某账号某键的临时记录（首次调用方负责传 prev_value_enc 快照） */
+export function upsertAccountKeyTemp(accountId, key, prevValueEnc, expiresAt) {
+  getDb()
+    .prepare(
+      'INSERT INTO account_key_temps (account_id, key, prev_value_enc, expires_at) VALUES (?,?,?,?)\n       ON CONFLICT(account_id, key) DO UPDATE SET expires_at = excluded.expires_at',
+    )
+    .run(Number(accountId), String(key), prevValueEnc === undefined ? null : prevValueEnc, Number(expiresAt));
+}
+
+/** 某账号已挂的按键级临时（可按 key 查） */
+export function getAccountKeyTemp(accountId, key) {
+  return (
+    getDb()
+      .prepare('SELECT account_id, key, prev_value_enc, expires_at FROM account_key_temps WHERE account_id = ? AND key = ?')
+      .get(Number(accountId), String(key)) ?? null
+  );
+}
+
+/** 某账号全部按键级临时（面板显示剩余时间用；**不带值**） */
+export function listAccountKeyTemps(accountId) {
+  return getDb()
+    .prepare('SELECT key, expires_at FROM account_key_temps WHERE account_id = ? ORDER BY expires_at')
+    .all(Number(accountId))
+    .map((r) => ({ key: r.key, expiresAt: r.expires_at }));
+}
+
+/** 已到期的全部按键级临时记录（清扫用） */
+export function listExpiredAccountKeyTemps(now = Date.now()) {
+  return getDb().prepare('SELECT account_id, key, prev_value_enc, expires_at FROM account_key_temps WHERE expires_at <= ?').all(now);
+}
+
+/** 删某账号某键的临时记录（手动长期写入 = 最高优先级时调） */
+export function deleteAccountKeyTemp(accountId, key) {
+  getDb().prepare('DELETE FROM account_key_temps WHERE account_id = ? AND key = ?').run(Number(accountId), String(key));
+}
+
+/** 删某账号的全部临时记录（账号被删 / 账号级临时到期清扫时调） */
+export function deleteAccountKeyTempsOf(accountId) {
+  getDb().prepare('DELETE FROM account_key_temps WHERE account_id = ?').run(Number(accountId));
+}
+
 /** 最近审计记录（新→旧；可选关键字过滤 action/detail/via） */
 export function listAudit(limit = 200, q) {
   const db = getDb();
@@ -197,7 +305,7 @@ export function listHosts() {
 export function addHost(host, pan) {
   const h = String(host ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   if (!h || h.includes('..') || h.includes('/') || h.length > 253) throw new Error('host 不合法（只接受纯域名）');
-  if (!['quark', 'uc', 'xunlei'].includes(pan)) throw new Error('pan 只支持 quark / uc / xunlei');
+  if (!['quark', 'uc', 'xunlei', 'alipan'].includes(pan)) throw new Error('pan 只支持 quark / uc / xunlei / alipan');
   const info = getDb()
     .prepare('INSERT OR IGNORE INTO hosts (host, pan, created_at) VALUES (?,?,?)')
     .run(h, pan, Date.now());

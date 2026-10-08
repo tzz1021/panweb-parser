@@ -12,10 +12,38 @@
  */
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { api, fmtTime, getSettings, postSettings, purgeLogs } from '../api.js';
+import { parseCookieText, looksStructured, toHeaderString } from '../cookieText.js';
 
-const PAN_KEYS = { quark: ['__pus', '__uid', '__puus'], uc: ['__pugs'] };
+// v1.4.1：与 backend/src/cookies.js#PAN_KEYS 对齐（补 xunlei / alipan，面板不再报「未知网盘」）
+const PAN_KEYS = {
+  quark: ['__pus', '__uid', '__puus'],
+  uc: ['__pugs'],
+  xunlei: ['authorization', 'to_parent_id', 'user_id'],
+  alipan: ['authorization', 'drive_id', 'to_parent_file_id'],
+};
 
-/** 与 SPA quark/cookies.ts 同构：整串里已有关键 key */
+const PAN_LABELS = { quark: 'quark（夸克）', uc: 'uc（UC）', xunlei: 'xunlei（迅雷）', alipan: 'alipan（阿里云盘）' };
+
+/** 转存类驱动的「特别参数」（可选）：随凭据串一起入库（PAN_KEYS 同名键） */
+const PAN_EXTRA_FIELDS = {
+  xunlei: [
+    { key: 'to_parent_id', label: '转存目标目录 fid（to_parent_id）', placeholder: '你自己网盘里目标文件夹的 file_id' },
+    { key: 'user_id', label: '账号 user_id（可空）', placeholder: '登录账号 user_id（captcha meta 用）' },
+  ],
+  alipan: [
+    { key: 'drive_id', label: 'drive_id', placeholder: '你的 drive_id（F12 抓包）' },
+    { key: 'to_parent_file_id', label: '转存目标目录（to_parent_file_id）', placeholder: '目标文件夹 file_id' },
+  ],
+};
+
+const PAN_PLACEHOLDER = {
+  quark: '粘贴完整 cookie 整串（含 __pus=…; __uid=…; __puus=…；或从已登录浏览器复制，支持 Netscape/JSON/Header 导入）',
+  uc: '粘贴 __pugs 值（下载层游客态凭据，208 字符）',
+  xunlei: '粘贴 authorization（Bearer xxx）或凭据串 authorization=…;to_parent_id=…;user_id=…（支持 Netscape/JSON/Header 导入，可直接粘贴 F12 里整段 Header）',
+  alipan: '粘贴凭据串 auth=Bearer xxx;drive_id=…;to_parent_file_id=…（支持 Netscape/JSON/Header 导入）',
+};
+
+/** 与 SPA quark/cookies.ts 同构：整串里已有关键 key（发现是按 网盘键 检测，含 authorization 类） */
 function keysPresent(cookieString, pan) {
   const stripped = String(cookieString ?? '').replace(/^cookie\s*:\s*/i, '');
   const keys = PAN_KEYS[pan] ?? [];
@@ -28,6 +56,21 @@ function keysPresent(cookieString, pan) {
   });
 }
 
+/**
+ * v1.4.1：输入即解析 —— Netscape / JSON 自动转成请求头格式（对齐 SPA parseCookieText），
+ * 面板不再只认 header string（之前要 Ctrl+F 才能发现已识别的键）。
+ */
+function normalizeCredentialInput(raw) {
+  if (!looksStructured(raw)) return { text: raw, note: '' };
+  try {
+    const parsed = parseCookieText(raw);
+    const n = Object.keys(parsed).length;
+    return { text: toHeaderString(parsed), note: `已识别 ${n} 个 cookie（Netscape/JSON）并转为请求头格式` };
+  } catch (err) {
+    return { text: raw, note: String(err?.message ?? '识别失败') };
+  }
+}
+
 function AccountForm({ initial, panKeys, onDone, toast, ttlDefault = 30 }) {
   const [pan, setPan] = useState(initial?.pan ?? 'quark');
   const [label, setLabel] = useState(initial?.label ?? '');
@@ -38,7 +81,28 @@ function AccountForm({ initial, panKeys, onDone, toast, ttlDefault = 30 }) {
   const [expiresAt, setExpiresAt] = useState(initial?.expiresAt ? new Date(initial.expiresAt).toISOString().slice(0, 16) : '');
   const [confirmToken, setConfirmToken] = useState('');
   const [busy, setBusy] = useState(false);
+  // v1.4.1：特别参数（转存类驱动）+ 粘贴格式识别提示 + 按键级临时/长期（遗留#1）
+  const [extras, setExtras] = useState({});
+  const [importNote, setImportNote] = useState('');
+  const [keyTemps, setKeyTemps] = useState({});
   const found = useMemo(() => keysPresent(cookieString, pan), [cookieString, pan]);
+
+  /** 输入即解析：Netscape / JSON 自动转 header 串（并给一行提示） */
+  const onCredentialChange = (raw) => {
+    const { text, note } = normalizeCredentialInput(raw);
+    setCookieString(text);
+    setImportNote(note);
+  };
+
+  /** 凭据串 = 粘贴的主凭据 + 特别参数（k=v，与 PAN_KEYS 同名） */
+  const credentialFull = () => {
+    const extra = (PAN_EXTRA_FIELDS[pan] ?? [])
+      .map((f) => [f.key, String(extras[f.key] ?? '').trim()])
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+    return [String(cookieString ?? '').trim(), extra].filter(Boolean).join('; ');
+  };
 
   const save = async () => {
     if (!confirmToken.trim()) {
@@ -52,7 +116,13 @@ function AccountForm({ initial, panKeys, onDone, toast, ttlDefault = 30 }) {
         id: initial?.id,
         pan,
         label,
-        cookieString,
+        cookieString: credentialFull(),
+        // v1.4.1 遗留#1：按键级临时（只提交标「临时」的键；其余按长期写入，服务端清其临时记录）
+        keyTemps: Object.fromEntries(
+          Object.entries(keyTemps)
+            .filter(([, t]) => t?.temp)
+            .map(([k, t]) => [k, { ttlMinutes: Number(t.minutes) || undefined }]),
+        ),
         expiresAt: expiresAt ? new Date(expiresAt).getTime() : null,
         temp: isTemp, // v1.3.1：临时写入（到期自动清除凭据，审计保留）
         ttlMinutes: Number(ttlMinutes) || undefined,
@@ -77,19 +147,43 @@ function AccountForm({ initial, panKeys, onDone, toast, ttlDefault = 30 }) {
         </p>
       )}
       <div className="row" style={{ marginBottom: 8 }}>
-        <select className="input" style={{ width: 130 }} value={pan} onChange={(e) => { setPan(e.target.value); setCookieString(''); }}>
-          <option value="quark">quark（夸克）</option>
-          <option value="uc">uc（UC）</option>
+        <select className="input" style={{ width: 150 }} value={pan} onChange={(e) => { setPan(e.target.value); setCookieString(''); setExtras({}); setImportNote(''); }}>
+          {Object.keys(PAN_KEYS).map((id) => (
+            <option key={id} value={id}>{PAN_LABELS[id] ?? id}</option>
+          ))}
         </select>
         <input className="input grow" placeholder="备注名（如 家庭-1号）" value={label} onChange={(e) => setLabel(e.target.value)} />
       </div>
       <textarea
         className="input"
         rows={3}
-        placeholder={pan === 'quark' ? '粘贴完整 cookie 整串（含 __pus=…; __uid=…; __puus=…；或从已登录浏览器复制，支持 Netscape/JSON/Header 导入）' : '粘贴 __pugs 值（下载层游客态凭据，208 字符）'}
+        placeholder={PAN_PLACEHOLDER[pan] ?? '粘贴凭据'}
         value={cookieString}
-        onChange={(e) => setCookieString(e.target.value)}
+        onChange={(e) => onCredentialChange(e.target.value)}
       />
+      {importNote && (
+        <p className="muted" style={{ margin: '4px 0 0', fontSize: 12 }}>{importNote}</p>
+      )}
+      {(PAN_EXTRA_FIELDS[pan] ?? []).length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <p className="muted" style={{ margin: '0 0 6px', fontSize: 12 }}>
+            特别参数（可选；随凭据串入库，键名与后端 PAN_KEYS 一致）：
+            {pan === 'xunlei' ? ' captcha_sign / device_id 等 captcha 身份在「凭据刷新」页的迅雷卡片里设置。' : ''}
+          </p>
+          <div className="row" style={{ flexWrap: 'wrap' }}>
+            {(PAN_EXTRA_FIELDS[pan] ?? []).map((f) => (
+              <input
+                key={f.key}
+                className="input mono"
+                style={{ width: 280 }}
+                placeholder={`${f.label}${f.placeholder ? `（${f.placeholder}）` : ''}`}
+                value={extras[f.key] ?? ''}
+                onChange={(e) => setExtras((prev) => ({ ...prev, [f.key]: e.target.value }))}
+              />
+            ))}
+          </div>
+        </div>
+      )}
       <p style={{ margin: '6px 0 0', fontSize: 12 }}>
         {found.length > 0 ? (
           <span className="tag">已检测到：{found.join(' / ')}</span>
@@ -97,6 +191,42 @@ function AccountForm({ initial, panKeys, onDone, toast, ttlDefault = 30 }) {
           <span className="muted">未检测到 {PAN_KEYS[pan].join(' / ')} —— 保存会被拒绝</span>
         )}
       </p>
+      {/* v1.4.1 遗留#1：按键级临时/长期（临时到期**恢复该键旧值**；不选 = 长期写入） */}
+      {found.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <p className="muted" style={{ margin: '0 0 6px', fontSize: 12 }}>
+            按键级临时/长期：临时键到期会**恢复该键写入前的旧值**（不是清空）；不选 = 长期写入（优先级最高，会清掉该键的临时记录）
+            {initial?.tempKeys?.length ? `。当前已挂临时：${initial.tempKeys.map((t) => `${t.key}（剩 ${Math.max(0, Math.round((t.expiresAt - Date.now()) / 60000))}m）`).join('、')}` : ''}
+          </p>
+          {found.map((k) => {
+            const t = keyTemps[k] ?? { temp: false, minutes: ttlDefault };
+            return (
+              <div className="row" key={k} style={{ gap: 6, marginBottom: 4, alignItems: 'center' }}>
+                <code className="mono" style={{ width: 140 }}>{k}</code>
+                <select
+                  className="input"
+                  style={{ width: 96 }}
+                  value={t.temp ? 'temp' : 'long'}
+                  onChange={(e) => setKeyTemps((p) => ({ ...p, [k]: { ...t, temp: e.target.value === 'temp' } }))}
+                >
+                  <option value="long">长期</option>
+                  <option value="temp">临时</option>
+                </select>
+                <input
+                  className="input mono"
+                  style={{ width: 90 }}
+                  type="number"
+                  min="1"
+                  disabled={!t.temp}
+                  value={t.minutes}
+                  onChange={(e) => setKeyTemps((p) => ({ ...p, [k]: { ...t, minutes: Number(e.target.value) } }))}
+                />
+                <span className="muted">分钟</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
       <div className="row" style={{ marginTop: 10 }}>
         <input className="input mono" style={{ width: 210 }} type="datetime-local" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} />
         <span className="muted">过期时间（可空）</span>
@@ -237,8 +367,14 @@ export default function Settings({ toast }) {
                     <td><span className={`tag ${a.status === 'ok' ? '' : 'red'}`}>{a.status}</span></td>
                     <td className="mono" style={{ fontSize: 12 }}>{a.userId || <span className="muted">-</span>}</td>
                     <td className="mono">{a.expiresAt ? fmtTime(a.expiresAt) : <span className="muted">-</span>}</td>
-                    <td className="mono">{a.tempExpiresAt ? fmtTime(a.tempExpiresAt) : <span className="muted">-</span>}</td>
-                    <td className="mono">{a.lastUsedAt ? fmtTime(a.lastUsedAt) : <span className="muted">-</span>}</td>
+                    <td className="mono">
+                      {a.tempExpiresAt ? fmtTime(a.tempExpiresAt) : <span className="muted">-</span>}
+                      {a.tempKeys?.length ? (
+                        <div className="muted" style={{ fontSize: 11 }}>
+                          按键：{a.tempKeys.map((t) => `${t.key}（剩 ${Math.max(0, Math.round((t.expiresAt - Date.now()) / 60000))}m）`).join('、')}
+                        </div>
+                      ) : null}
+                    </td>                    <td className="mono">{a.lastUsedAt ? fmtTime(a.lastUsedAt) : <span className="muted">-</span>}</td>
                     <td>
                       <div className="row" style={{ gap: 4 }}>
                         <button className="btn btn-sm" onClick={() => setForm({ id: a.id, pan: a.pan, label: a.label, kind: a.kind, expiresAt: a.expiresAt, isTemp: a.isTemp })}>覆盖写入</button>
