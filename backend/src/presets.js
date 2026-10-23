@@ -165,6 +165,7 @@ export async function runPreset(id, via = 'webui') {
   }
 
   const cdpPort = defaultCdpPort();
+  log('info', `预设 ${id}：开始（CDP 127.0.0.1:${cdpPort} → ${preset.url}）`, { console: true });
   runtime.set(id, { ...st, state: 'running', running: true, lastRunAt: now, lastMessage: '运行中…' });
   inFlight = id;
   audit('preset.run', `${preset.id}（${preset.pan}）手动触发`, via);
@@ -177,6 +178,7 @@ export async function runPreset(id, via = 'webui') {
       return { ok: false, message: msg };
     }
 
+    log('info', `预设 ${id}：CDP 已连接，开始导航 ${preset.url}（settleMs=${preset.settleMs}）`, { console: true });
     const payload = await evaluateOnPage({
       url: preset.url,
       expression: probeExpression(preset.probes),

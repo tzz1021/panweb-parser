@@ -90,6 +90,11 @@ cd ~/panhub_praser && ./backend/launcher.sh setup && ./backend/launcher.sh start
 - UI 部分参考 [pdpb.cn](https://pdpb.cn)（布局与配色）
 - 功能方向参考 [nfd 云解析](https://github.com/qaiu/netdisk-fast-download)（自托管思路）
 - 版权与迁移说明见 [docs/migration-linkswift.md](docs/migration-linkswift.md)
+## 其他项目代码借鉴
+
+- 云析 [CYQawa/YunX](https://github.com/CYQawa/YunX)
+
+详细源码使用说明见[THIRD-PART.md](./docs/THIRD-PART.md)
 
 ## License
 

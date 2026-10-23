@@ -59,6 +59,8 @@ export async function fetchLinks(
         onProgress: options?.onProgress,
         // v1.4 取链参数覆盖（用户弹窗选择；缺省由适配器按设置规则决定）
         usage: options?.usage,
+        // v1.4.1-fix 压缩包处理（none/suffix/strip）
+        renameMode: options?.renameMode,
       });
       // 适配器返回与输入顺序一致（接口契约）；逐一回填，数量不足时补失败项
       for (let j = 0; j < batch.length; j++) {

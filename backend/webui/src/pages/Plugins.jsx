@@ -22,6 +22,50 @@ export default function Plugins({ toast }) {
   const [data, setData] = useState(null);
   const [busyId, setBusyId] = useState(null);
   // v1.4：迅雷凭据（CDP 一条龙）——状态 + 抓取/刷新
+  // v1.4.1-fix 签名 profile（实时计算 / 热加载）
+  const [sign, setSign] = useState(null);
+  const [signForm, setSignForm] = useState(null);
+  const [signBusy, setSignBusy] = useState(false);
+
+  const loadSign = async () => {
+    const r = await api('/api/web/xunlei/sign-profile');
+    if (r.ok) {
+      setSign(r.data);
+      const prof = r.data.profile ?? {};
+      setSignForm({
+        client_id: prof.client_id ?? '',
+        client_version: prof.client_version ?? '',
+        package_name: prof.package_name ?? '',
+        saltsText: (prof.salts ?? []).join('\n'),
+        mode: r.data.mode ?? 'live',
+        deviceId: r.data.deviceId ?? '',
+      });
+    }
+  };
+
+  const saveSign = async () => {
+    const confirmToken = window.prompt('修改签名 profile 会影响全部 captcha 请求：请输入 WebUI 令牌确认');
+    if (!confirmToken) return;
+    setSignBusy(true);
+    const r = await api('/api/web/xunlei/sign-profile', {
+      method: 'POST',
+      body: {
+        profile: {
+          client_id: signForm.client_id,
+          client_version: signForm.client_version,
+          package_name: signForm.package_name,
+          salts: String(signForm.saltsText || '').split('\n').map((t) => t.trim()).filter(Boolean),
+        },
+        mode: signForm.mode,
+        deviceId: signForm.deviceId,
+      },
+      confirmToken: confirmToken.trim(),
+    });
+    setSignBusy(false);
+    toast(r.ok ? `已保存（${r.data?.mode}，自检 ${r.data?.selfTest?.ok ? 'PASS' : 'FAIL'}）` : (r.data?.message ?? '保存失败'), r.ok ? 'ok' : 'err');
+    loadSign();
+  };
+
   const [xl, setXl] = useState(null);
   const [xlBusy, setXlBusy] = useState(false);
   // v1.4.1：CDP 端口（可手动输入）+ port↔账号绑定列表
@@ -42,6 +86,10 @@ export default function Plugins({ toast }) {
   };
   useEffect(() => {
     load();
+    loadSign();
+    // v1.4.1-fix：浏览器 health 不缓存 —— 每 10s 重新探测（面板显示的「已连接」必须是最新事实）
+    const timer = setInterval(load, 10_000);
+    return () => clearInterval(timer);
   }, []);
 
   /** v1.4.1：手动写入特别参数/ captcha 身份（**长期**写入；只提交填写的键，不覆盖空值） */
@@ -106,6 +154,8 @@ export default function Plugins({ toast }) {
           <span className={`tag ${browserOk ? '' : 'red'}`}>{browserOk ? '已连接' : '未连接'}</span>
           <span className="muted mono">127.0.0.1:{data.browser?.port}</span>
           {browserOk ? <span className="muted">{data.browser.browser}</span> : <span className="muted">{data.browser?.reason}</span>}
+          <button className="btn btn-sm" onClick={load}>重新探测</button>
+          <span className="muted" style={{ fontSize: 11 }}>每 10s 自动探测</span>
         </div>
         {!browserOk && (
           <p className="muted" style={{ margin: '8px 0 0' }}>
@@ -140,6 +190,64 @@ export default function Plugins({ toast }) {
           </div>
         </div>
       ))}
+
+      {/* v1.4.1-fix 迅雷签名（实时计算 / 热加载） */}
+      <div className="card">
+        <div className="row">
+          <h3 style={{ margin: 0 }}>迅雷签名（实时计算 / 热加载）</h3>
+          <span className={`tag ${sign?.selfTest?.ok ? '' : 'red'}`}>{sign?.selfTest?.ok ? '自检 PASS' : '自检 FAIL'}</span>
+          <span className="tag gray">mode: {sign?.mode ?? '-'}</span>
+        </div>
+        <p className="muted" style={{ margin: '8px 0 0' }}>
+          **大约 20 天官方换一次 salt，没法用了记得改这里；修改后热加载**（每次请求重新读设置，无需重启）。
+          live 模式用下面 profile **实时计算** sign，并用**同一 profile** 的 client_id/version/package 组 meta（避免 sign 与 meta 版本不配套）。
+        </p>
+        {signForm && (
+          <div style={{ marginTop: 10 }}>
+            <div className="row" style={{ flexWrap: 'wrap', gap: 6 }}>
+              <select className="input" style={{ width: 110 }} value={signForm.mode} onChange={(e) => setSignForm((p) => ({ ...p, mode: e.target.value }))}>
+                <option value="live">live（实时算）</option>
+                <option value="manual">manual（手填 sign）</option>
+              </select>
+              <input className="input mono" style={{ width: 190 }} placeholder="client_id" value={signForm.client_id} onChange={(e) => setSignForm((p) => ({ ...p, client_id: e.target.value }))} />
+              <input className="input mono" style={{ width: 110 }} placeholder="client_version" value={signForm.client_version} onChange={(e) => setSignForm((p) => ({ ...p, client_version: e.target.value }))} />
+              <input className="input mono" style={{ width: 170 }} placeholder="package_name" value={signForm.package_name} onChange={(e) => setSignForm((p) => ({ ...p, package_name: e.target.value }))} />
+            </div>
+            <div className="row" style={{ marginTop: 8, gap: 6 }}>
+              <input
+                className="input mono grow"
+                style={{ minWidth: 320 }}
+                placeholder="device_id（live 可留空自动生成；填 regenerate 则重置）"
+                value={signForm.deviceId}
+                onChange={(e) => setSignForm((p) => ({ ...p, deviceId: e.target.value }))}
+              />
+              <button className="btn btn-sm" onClick={() => setSignForm((p) => ({ ...p, deviceId: 'regenerate' }))}>重置 device_id</button>
+            </div>
+            <textarea
+              className="input mono"
+              rows={5}
+              style={{ marginTop: 8, width: '100%', fontSize: 12 }}
+              placeholder="salts（每行一条，顺序敏感）"
+              value={signForm.saltsText}
+              onChange={(e) => setSignForm((p) => ({ ...p, saltsText: e.target.value }))}
+            />
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn btn-sm btn-primary" onClick={saveSign} disabled={signBusy}>{signBusy ? '保存中…' : '保存（热加载）'}</button>
+              <button className="btn btn-sm" onClick={loadSign}>重新自检</button>
+              {sign?.selfTest && (
+                <span className={`muted mono`} style={{ fontSize: 11 }}>
+                  {sign.selfTest.ok ? 'PASS' : 'FAIL'} · got {String(sign.selfTest.got).slice(0, 20)}… want {String(sign.selfTest.want).slice(0, 20)}…
+                </span>
+              )}
+            </div>
+            {signForm.mode === 'manual' && (
+              <p className="muted" style={{ margin: '6px 0 0', fontSize: 12 }}>
+                manual 模式用「迅雷凭据」卡片里手填的 captcha_sign / captcha_timestamp；**必须与 client 三件套 + device_id 配套**，否则上游会返回 invalid captcha_sign。
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* v1.4 迅雷凭据：面板一条龙（CDP 抓 authorization → 账号池 + 设置；面板只看脱敏状态） */}
       <div className="card">

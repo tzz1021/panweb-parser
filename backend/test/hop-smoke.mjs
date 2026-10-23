@@ -3,8 +3,11 @@ import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
 import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const BACKEND = new URL('../', import.meta.url).pathname;
+// 注意：仓库可能位于非 ASCII 路径（如 `下载/`），必须用 fileURLToPath 解码，
+// 否则 cwd 是 %E4%B8%8B... 形态 → spawn 报 ENOENT
+const BACKEND = fileURLToPath(new URL('../', import.meta.url));
 const DATA = join(BACKEND, 'data');
 
 let pass = 0;
@@ -234,6 +237,13 @@ check('xunlei captcha-token 无令牌 → 401', xlNoToken.status === 401, `statu
 const xlBadAction = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'not-an-action' }) });
 check('xunlei captcha-token 非法 action → 400', xlBadAction.status === 400, `status=${xlBadAction.status}`);
 
+// v1.4.1-fix：以下一组断言验的是**manual 模式**（手动录入 sign 原样使用），先显式切模式；live 模式在下一段单独验
+await fetch(`${base}/api/web/xunlei/sign-profile`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, mode: 'manual' }),
+});
+
 const xlUnconfigured = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'post:/drive/v1/share/restore' }) });
 const xlUncfgBody = await xlUnconfigured.json();
 check('未配 sign → 400 + 中文明确错误（不静默）', xlUnconfigured.status === 400 && xlUncfgBody.error === 'XUNLEI_NOT_CONFIGURED' && /captcha_sign/.test(xlUncfgBody.message ?? ''), JSON.stringify(xlUncfgBody));
@@ -245,7 +255,7 @@ const fakeDevice = 'a'.repeat(32);
 r = await fetch(`${base}/api/web/settings`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
-  body: JSON.stringify({ xunlei: { captcha_sign: '1.fakesign', captcha_timestamp: '1700000000000', device_id: fakeDevice } }),
+  body: JSON.stringify({ xunlei: { captcha_sign: '1.fakesign', captcha_timestamp: '1700000000000', device_id: fakeDevice, client_version: '1.93.6' } }),
 });
 check('迅雷 captcha 设置写入', r.ok, `status=${r.status}`);
 const xlSettings = await (await fetch(`${base}/api/web/settings`, { headers: { 'x-webui-token': webuiToken } })).json();
@@ -264,6 +274,22 @@ check('同 action 二次请求命中缓存（不发上游）', xlCached.ok && xl
 const xlOther = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'get:/drive/v1/files' }) });
 const xlOtherBody = await xlOther.json();
 check('不同 action 不共享缓存（重新 init）', xlOther.ok && xlOtherBody.cached === false && mockHits.length === 2, JSON.stringify(xlOtherBody));
+
+// v1.4.1-fix：live 模式回归 —— 不依赖录入 sign，实时算且 meta 与 profile 三件套一致
+await fetch(`${base}/api/web/xunlei/sign-profile`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, mode: 'live', profile: { client_id: 'Xqp0kJBXWhwaTpB6', client_version: '1.93.10', package_name: 'pan.xunlei.com' } }),
+});
+const xlLive = await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'get:/drive/v1/share' }) });
+const xlLiveBody = await xlLive.json();
+const xlLiveHit = mockHits[mockHits.length - 1];
+const xlLiveMeta = xlLiveHit ? JSON.parse(xlLiveHit.body).meta : {};
+check(
+  'live 模式：不依赖录入 sign、meta 与 profile 一致',
+  xlLive.ok && /^1\.[0-9a-f]{32}$/.test(String(xlLiveMeta.captcha_sign)) && xlLiveMeta.client_version === '1.93.10' && xlLiveMeta.package_name === 'pan.xunlei.com',
+  JSON.stringify({ body: xlLiveBody, meta: xlLiveMeta }).slice(0, 300),
+);
 
 // ⑩.7 v1.4 迅雷账号相关 ops（/api/xunlei/op；全部打本地 mock，不动真上游）
 const xlOpNoToken = await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'download', fid: 's1' }) });
@@ -298,7 +324,7 @@ const opRestore = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', 
 check('op restore → trace_file_ids 映射', opRestore.ok === true && opRestore.results?.length === 2 && opRestore.results[0].fileId === 'my1', JSON.stringify(opRestore));
 
 const bizHit = mockHits.filter((h) => h.url.includes('/drive/') && h.headers['x-captcha-token']).pop();
-check('上游业务请求带 backend 自己的 device/captcha/authorization', Boolean(bizHit) && bizHit.headers['x-device-id'] === fakeDevice && bizHit.headers['authorization'] === 'Bearer FAKE-AUTH' && Boolean(bizHit.headers['x-captcha-token']), JSON.stringify(bizHit && { dev: bizHit.headers['x-device-id'], auth: bizHit.headers['authorization'], act: bizHit.url }));
+check('上游业务请求带 backend 自己的 device/captcha/authorization', Boolean(bizHit) && bizHit.headers['x-device-id'] === fakeDevice && bizHit.headers['authorization'] === 'Bearer FAKE-AUTH' && /^mock-token-\d+$/.test(String(bizHit.headers['x-captcha-token'])), JSON.stringify(bizHit && { dev: bizHit.headers['x-device-id'], auth: bizHit.headers['authorization'], tok: bizHit.headers['x-captcha-token'], act: bizHit.url }));
 
 // ⑩.8 v1.4：取链参数 usage（CONSUME/PLAY）透传到上游 query（白名单外回落 CONSUME）
 const opPlay = await (await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'download', fid: 's1', usage: 'PLAY' }) })).json();
@@ -487,6 +513,48 @@ check('③ 手动长期写入 → 清掉该键临时记录', !(ktDetail4.tempKey
 await sleep(2300);
 await fetch(`${base}/api/web/accounts`, { headers: { 'x-webui-token': webuiToken } });
 check('③ 值不回退（manual-uid 保持）', credOf(ktId).includes('__uid=manual-uid'), credOf(ktId));
+
+// ⑩.999 v1.4.1-fix 签名 profile（热加载 / meta 同源 / 自检）+ 压缩 rename 模式
+const signMod = await import(`${BACKEND}src/xunlei-sign.js`);
+const sp0 = await (await fetch(`${base}/api/web/xunlei/sign-profile`, { headers: { 'x-webui-token': webuiToken } })).json();
+check('签名 profile 默认自检 PASS（1.93.10 已知向量）', sp0.ok === true && sp0.selfTest?.ok === true && sp0.mode === 'live', JSON.stringify(sp0.selfTest));
+
+const customProfile = { client_id: 'TEST-CLIENT', client_version: '9.9.9', package_name: 'pan.xunlei.com', salts: ['saltA', 'saltB'] };
+const spSave = await fetch(`${base}/api/web/xunlei/sign-profile`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, profile: customProfile, mode: 'live' }),
+});
+const spSaveBody = await spSave.json();
+check('保存自定义 profile（自检 FAIL 属预期）', spSave.ok && spSaveBody.profile?.client_version === '9.9.9' && spSaveBody.selfTest?.ok === false, JSON.stringify(spSaveBody.selfTest));
+
+const beforeSign = mockHits.length;
+await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'post:/drive/v1/settings' }) });
+const initHit = mockHits.slice(beforeSign).find((h) => h.url.includes('/v1/shield/captcha/init'));
+const initBody = JSON.parse(initHit?.body ?? '{}');
+check('① live init：meta 与 sign 同 profile（client_id 顶层 + version/package 在 meta）', initBody.client_id === 'TEST-CLIENT' && initBody.meta?.client_version === '9.9.9' && initBody.meta?.package_name === 'pan.xunlei.com', JSON.stringify({ client_id: initBody.client_id, meta: initBody.meta }));
+check('① live 模式的 sign 由同一 profile 实时算出', initBody.meta?.captcha_sign === signMod.captchaSign({ timestamp: initBody.meta?.timestamp, deviceId: initBody.device_id, profile: customProfile }), JSON.stringify({ got: initBody.meta?.captcha_sign }));
+
+await fetch(`${base}/api/web/xunlei/sign-profile`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-webui-token': webuiToken, 'x-csrf-token': csrf },
+  body: JSON.stringify({ confirmToken: webuiToken, profile: { ...customProfile, client_version: '8.8.8' }, mode: 'live' }),
+});
+const beforeReload = mockHits.length;
+await fetch(`${base}/api/xunlei/captcha-token`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ action: 'get:/drive/v1/files' }) });
+const reloadHit = mockHits.slice(beforeReload).find((h) => h.url.includes('/v1/shield/captcha/init'));
+const reloadBody = JSON.parse(reloadHit?.body ?? '{}');
+check('② 改 profile 后立即生效（热加载 version=8.8.8）', reloadBody.meta?.client_version === '8.8.8' && reloadBody.client_id === 'TEST-CLIENT', JSON.stringify(reloadBody.meta));
+
+// 压缩 rename 模式：strip 抹去扩展名 / suffix 随机三位
+const beforeRename2 = mockHits.length;
+await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'rename', fid: 'my1', name: 'a.zip', mode: 'strip' }) });
+const stripHit = mockHits.slice(beforeRename2).find((h) => h.method === 'PATCH');
+check('④ 抹去后缀 → PATCH name="a"', JSON.parse(stripHit?.body ?? '{}').name === 'a', stripHit?.body);
+const beforeRename3 = mockHits.length;
+await fetch(`${base}/api/xunlei/op`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-proxy-token': proxyToken }, body: JSON.stringify({ op: 'rename', fid: 'my1', name: 'b.zip', mode: 'suffix' }) });
+const suffixHit = mockHits.slice(beforeRename3).find((h) => h.method === 'PATCH');
+check('④ 加随机后缀 → name="b.zip.<三位补零>"', /^b\.zip\.\d{3}$/.test(JSON.parse(suffixHit?.body ?? '{}').name ?? ''), suffixHit?.body);
 
 // ⑪ 严格终端：未开启时 ws 应 403；开启后过滤高危命令
 r = await fetch(`${base}/api/web/settings`, {

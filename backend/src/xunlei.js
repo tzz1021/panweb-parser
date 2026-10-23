@@ -21,11 +21,14 @@ import { getConfig } from './config.js';
 import { getSetting, setSetting, getDb, decrypt } from './db.js';
 import { upsertAccount } from './cookies.js';
 import { decodeXunleiJwt } from './xunlei-cdp.js';
+import { randomBytes } from 'node:crypto';
+import { captchaSign, normalizeSignProfile, signSelfTest } from './xunlei-sign.js';
 
-/** 内置 web 端身份默认值（Tzz 浏览器抓包；与 src/adapters/xunlei/types.ts#XL_WEB_CLIENT 同源） */
+/** 内置 web 端身份默认值（与 `xunlei-sign.js#SIGN_PROFILE_DEFAULTS` 同源；官方换盐时改那边） */
 const WEB_DEFAULTS = {
   client_id: 'Xqp0kJBXWhwaTpB6',
-  client_version: '1.93.6',
+  // v1.4.1-fix：官方 2026-10 已是 1.93.10（旧 1.93.6 配新 sign 必报 invalid captcha_sign）
+  client_version: '1.93.10',
   package_name: 'pan.xunlei.com',
 };
 
@@ -40,7 +43,7 @@ const MANUAL_DEFAULTS = {
   user_id: '',
 };
 
-const DEFAULTS = { ...WEB_DEFAULTS, ...MANUAL_DEFAULTS };
+const DEFAULTS = { ...WEB_DEFAULTS, ...MANUAL_DEFAULTS, sign_mode: 'live', sign_profile: '' };
 
 /** 设置键前缀（settings 表内键名 = `xunlei_<key>`，与契约给出的设置名一致） */
 const SETTING_PREFIX = 'xunlei_';
@@ -68,6 +71,41 @@ export function xunleiSetting(key) {
 /** sign 是否已录入（只要 sign 与 timestamp 都在即可用；device_id 缺失会退化为空串→上游会判 invalid） */
 export function xunleiSignConfigured() {
   return Boolean(xunleiSetting('captcha_sign') && xunleiSetting('captcha_timestamp'));
+}
+
+/**
+ * 签名模式：
+ * - `live`（默认，推荐）：每次请求实时算 sign —— 天然与 meta 里的 client_version/package 配套，
+ *   官方改盐后只需改「sign profile」，不靠手工同步 timestamp；
+ * - `manual`：用面板/设置里录入的 `(captcha_sign, captcha_timestamp)`，要求与 client_version/package/device 严格配套。
+ */
+export function xunleiSignMode() {
+  return String(xunleiSetting('sign_mode') || 'live') === 'manual' ? 'manual' : 'live';
+}
+
+/** 当前签名 profile（面板可改；每次读设置 = 热加载，无需重启） */
+export function xunleiSignProfile() {
+  const raw = xunleiSetting('sign_profile');
+  if (!raw) return normalizeSignProfile(null);
+  try {
+    return normalizeSignProfile(JSON.parse(String(raw)));
+  } catch {
+    return normalizeSignProfile(null);
+  }
+}
+
+/** 面板自检（用已知向量验证当前 profile 是否仍为官方那版；改盐后 FAIL 属预期） */
+export function xunleiSignProfileSelfTest() {
+  return signSelfTest(xunleiSignProfile());
+}
+
+/** live 模式用的 device_id：缺省自动生成并落库（device_id 不是凭据，只是客户端标识） */
+function signDeviceId() {
+  const existing = String(xunleiSetting('device_id') || '').trim();
+  if (/^[0-9a-f]{32}$/i.test(existing)) return existing;
+  const generated = randomBytes(16).toString('hex');
+  setSetting('xunlei_device_id', generated);
+  return generated;
 }
 
 /** 面板读视图：sign 只回「是否配置 + 长度/前缀」，**不回明文**；device_id 属操作者自查项，原样回 */
@@ -136,25 +174,45 @@ export async function captchaTokenForAction(action, opts = {}) {
     return { captcha_token: hit.token, expires_in: Math.round((hit.expiresAt - now) / 1000), cached: true };
   }
 
-  const sign = xunleiSetting('captcha_sign');
-  const timestamp = xunleiSetting('captcha_timestamp');
-  if (!sign) throw new XunleiTokenConfigError('未配置迅雷 captcha_sign：请在「系统配置 → 迅雷」录入 web 端 captcha_sign（并同步 captcha_timestamp）');
-  if (!timestamp) throw new XunleiTokenConfigError('未配置迅雷 captcha_timestamp：必须与 captcha_sign 配套录入');
-  const deviceId = xunleiSetting('device_id');
-  if (!deviceId) throw new XunleiTokenConfigError('未配置迅雷 device_id：必须与录入的 captcha_sign 配套（同一 device 生成的 sign）');
+  // v1.4.1-fix：签名分两种模式（live 默认）——见 xunleiSignMode 注释
+  const mode = xunleiSignMode();
+  const deviceId = signDeviceId();
+  let sign;
+  let timestamp;
+  let identity;
+  if (mode === 'live') {
+    const profile = xunleiSignProfile();
+    timestamp = String(Date.now());
+    sign = captchaSign({ timestamp, deviceId, profile });
+    identity = { client_id: profile.client_id, client_version: profile.client_version, package_name: profile.package_name };
+  } else {
+    sign = xunleiSetting('captcha_sign');
+    timestamp = xunleiSetting('captcha_timestamp');
+    if (!sign) {
+      throw new XunleiTokenConfigError(
+        '未配置迅雷 captcha_sign：建议在面板改用「实时计算」模式（推荐），或同时录入 captcha_sign + captcha_timestamp',
+      );
+    }
+    if (!timestamp) throw new XunleiTokenConfigError('未配置迅雷 captcha_timestamp：必须与 captcha_sign 配套录入');
+    identity = {
+      client_id: xunleiSetting('client_id'),
+      client_version: xunleiSetting('client_version'),
+      package_name: xunleiSetting('package_name'),
+    };
+  }
 
   const body = {
-    client_id: xunleiSetting('client_id'),
+    client_id: identity.client_id,
     action: act,
     device_id: deviceId,
     meta: {
       username: '',
       phone_number: '',
       email: '',
-      package_name: xunleiSetting('package_name'),
-      client_version: xunleiSetting('client_version'),
+      package_name: identity.package_name,
+      client_version: identity.client_version,
       captcha_sign: sign,
-      // 服务端只用请求里的 timestamp 重算校验（无时效校验）→ 原样带上录入值
+      // manual：原样带录入值（服务端用请求里的 timestamp 重算校验，无时效校验）；live：刚才的时间戳
       timestamp: String(timestamp),
       user_id: opts.userId ? String(opts.userId) : '0',
     },
@@ -169,7 +227,7 @@ export async function captchaTokenForAction(action, opts = {}) {
       headers: {
         'content-type': 'text/plain;charset=UTF-8',
         accept: '*/*',
-        'x-client-id': xunleiSetting('client_id'),
+        'x-client-id': identity.client_id,
         'x-device-id': deviceId,
       },
       body: JSON.stringify(body),
@@ -190,7 +248,11 @@ export async function captchaTokenForAction(action, opts = {}) {
   }
   if (!res.ok) {
     const detail = data?.error_description || data?.error || text.slice(0, 120) || `HTTP ${res.status}`;
-    throw new XunleiTokenUpstreamError(`迅雷验证码服务返回 HTTP ${res.status}：${detail}（sign 失效/身份不配套时请滚动更新 captcha_sign）`);
+    const hint =
+      mode === 'manual'
+        ? '（manual 模式：sign 必须与 client_version / package_name / device_id 配套；官方改盐后请改「sign profile」或切到「实时计算」）'
+        : '（live 模式：多为 sign profile 的 salt 已过期——官方约 20 天改一次，去面板改 sign profile）';
+    throw new XunleiTokenUpstreamError(`迅雷验证码服务返回 HTTP ${res.status}：${detail}${hint}`);
   }
   if (!data || typeof data !== 'object' || !data.captcha_token) {
     throw new XunleiTokenUpstreamError(`迅雷验证码服务未返回 captcha_token${data?.error ? `（${data.error}）` : ''}`);
@@ -388,13 +450,15 @@ function buildQuery(query) {
 
 /** 带登录态 + captcha 的迅雷业务请求（backend 自己的 device/sign/authorization） */
 async function xlRequest(account, { method, path, query, body, action }) {
+  // v1.4.3 fix：captchaTokenForAction 返回 { captcha_token, expires_in, cached }，
+  // 不能把整个对象塞进头部（会被序列化成 [object Object] → 上游 400 captcha_invalid / code 9）
   const token = await captchaTokenForAction(action, { userId: account.userId });
   const res = await fetch(`${xlApiBase()}${path}${buildQuery(query)}`, {
     method,
     headers: {
       'x-client-id': xunleiSetting('client_id'),
       'x-device-id': xunleiSetting('device_id'),
-      'x-captcha-token': token,
+      'x-captcha-token': token.captcha_token,
       authorization: /^Bearer\s/i.test(account.authorization) ? account.authorization : `Bearer ${account.authorization}`,
       accept: '*/*',
       'content-type': 'application/json',
@@ -543,10 +607,17 @@ export async function runOp(op, payload = {}) {
     if (op === 'rename') {
       const fid = String(payload.fid ?? '');
       if (!fid) return opFail('BAD_REQUEST', 'rename 需要 fid');
-      const base = String(payload.name ?? '').replace(/\s+$/, '') || fid;
-      // 三位补零随机数伪装分卷（不要固定 001；Tzz 定稿）
-      const suffix = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
-      const name = `${base}.${suffix}`;
+      const rawBase = String(payload.name ?? '').replace(/\s+$/, '') || fid;
+      // v1.4.1-fix 压缩三态：suffix = 三位补零随机数伪装分卷；strip = 抹去最后一个扩展名
+      const mode = payload.mode === 'strip' ? 'strip' : 'suffix';
+      let name;
+      if (mode === 'strip') {
+        const dot = rawBase.lastIndexOf('.');
+        name = dot > 0 ? rawBase.slice(0, dot) : rawBase;
+      } else {
+        const suffix = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
+        name = `${rawBase}.${suffix}`;
+      }
       const r = await xlRequest(account, {
         method: 'PATCH',
         path: `/drive/v1/files/${encodeURIComponent(fid)}`,
@@ -554,7 +625,7 @@ export async function runOp(op, payload = {}) {
         action: 'patch:/drive/v1/files',
       });
       const err = upstreamError(r, '重命名（压缩包出直链）');
-      return err ?? { ok: true, name };
+      return err ?? { ok: true, name, mode };
     }
 
     if (op === 'download') {

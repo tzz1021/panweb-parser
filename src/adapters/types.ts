@@ -124,6 +124,11 @@ export interface DownloadParams {
    * 缺省 = 适配器按设置规则（文件名匹配）自行决定，再不中则 CONSUME。
    */
   usage?: 'CONSUME' | 'PLAY';
+  /**
+   * v1.4.2 压缩包处理（三态）：none（默认，不重命名；仅 PLAY 能出链）/ suffix / strip；
+   * 非压缩类忽略。
+   */
+  renameMode?: 'none' | 'suffix' | 'strip';
 }
 
 /** 单文件直链结果 */

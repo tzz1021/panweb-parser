@@ -5,7 +5,6 @@
 
 ## [1.4.1] 2026-10-08 —— 后端与面板修复批次（凭据参数 / 智能写入 / CDP 绑定）+ SPA 两处修正
 
-> 状态：**已实现待审**（未 commit / 未 push；tag 建议 `1.4.1`）。
 > 背景：前台 SPA 已先推送；本批以后端/webui 为主，SPA 另修两处（proxy 凭据、粘贴即解析）。
 
 ### 新增
@@ -33,6 +32,20 @@
 ### 变更
 - xunlei 特别参数落 `settings`、alipan 落凭据串（两者各与其已有同源，不新开第二套）。
 - 未改 CDP 抓取自身行为（仅新增 `getAllCookies` 原语）；真机 CDP 与面板交互仍待人工核。
+
+### 新增fix（签名 / 压缩三态，随 1.4.1 同批）
+- **迅雷签名模块化 + live 模式**：`backend/src/xunlei-sign.js`（client_id/client_version/package/**salts** 一份 profile + `captchaSign()` + `signSelfTest()`）；
+  `sign_mode` 默认 **live**（每次实时算 sign，meta 三件套同 profile → 根治「sign 与 meta 版本不配套 → 400 invalid captcha_sign」）；manual 保留原逻辑。
+  默认值更新为 **1.93.10 + 9 盐**（2026-10 官方换盐；旧 8 盐/1.93.6 已失效，实测同 sign 配 1.93.6 = 400、配 1.93.10 = 200）。
+- **面板「迅雷签名（实时计算/热加载）」**：`GET/POST /api/web/xunlei/sign-profile`（二次确认令牌、改完清 token 缓存 + 审计）；
+  UI 可编辑 profile / 切 live·manual / 重置 device_id / 自检（PASS·FAIL + got/want），副标题「大约 20 天官方换一次 salt…修改后热加载」。
+- **压缩包三态**（zip/7z/rar）：`renameMode = none | suffix | strip`；`none` 强制 **PLAY**（①与②同请求必同时返回且完全一样，无需 rename）；
+  `suffix`（随机三位补零）/`strip`（抹去扩展名）才 rename，且按所选 usage；取链方案弹窗新增三选，仅本批含压缩类时显示；
+  同号探测命中时若用户显式选了 rename 则不复用探测结果。
+
+### 修复（随 1.4.1 同批）
+- 账号列表加 `cache-control: no-store`（删号后不再显示旧缓存）。
+- 预设面板 health 改**每 10s 实时探测** + 「重新探测」；`runPreset` 日志补端口/目标 URL，导航前后各一条，失败不静默。
 
 ## [1.4] 2026-10-03 —— 迅雷云盘适配器（第四个驱动）
 

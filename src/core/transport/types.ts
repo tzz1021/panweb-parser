@@ -122,6 +122,8 @@ export interface XunleiOpPayload {
   fid?: string;
   /** rename 的原始文件名（backend 追加 3 位补零随机数伪装分卷） */
   name?: string;
+  /** v1.4.1-fix 压缩三态：suffix（默认，随机后缀）/ strip（抹去扩展名） */
+  mode?: 'suffix' | 'strip';
   /**
    * v1.3.3（五批）取链参数：`CONSUME`（默认）/ `PLAY`（流式）。
    * 影响 `/files/{id}?space=&usage=` 返回的直链集合（PLAY 常比 CONSUME 快，压缩包有奇效）。

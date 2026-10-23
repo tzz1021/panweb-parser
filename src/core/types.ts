@@ -168,6 +168,8 @@ export interface LinkFetchOptions {
   onProgress?: (evt: import('../adapters/types').LinkProgressEvent) => void;
   /** v1.4 取链参数覆盖（可选）：原样透传 DownloadParams.usage（用户弹窗选择）。 */
   usage?: 'CONSUME' | 'PLAY';
+  /** v1.4.1-fix 压缩包处理（三态；原样透传 DownloadParams.renameMode）。 */
+  renameMode?: 'none' | 'suffix' | 'strip';
 }
 
 /* ============================== 偏好设置 ============================== */

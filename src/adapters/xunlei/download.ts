@@ -266,12 +266,14 @@ async function fetchOne(
   file: ShareFile,
   fid: string,
   usage: XlUsage,
+  renameMode: 'none' | 'suffix' | 'strip',
   onStage?: (stage: 'rename' | 'download') => void,
 ): Promise<DownloadResult> {
   try {
-    if (isCompress(file)) {
+    // v1.4.1-fix：压缩类默认**不重命名**（改用 PLAY 出链）；只有用户选 suffix/strip 才 rename
+    if (isCompress(file) && renameMode !== 'none') {
       onStage?.('rename');
-      await op({ op: 'rename', fid, name: file.fileName }, '重命名压缩包');
+      await op({ op: 'rename', fid, name: file.fileName, mode: renameMode === 'strip' ? 'strip' : 'suffix' }, '重命名压缩包');
       await sleep(XL_OP_INTERVAL_MS); // rename 与 download 之间间隔 1s
     }
     onStage?.('download');
@@ -308,7 +310,13 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
 
   // v1.4 取链参数：显式覆盖（弹窗）> 设置规则（文件名匹配）> CONSUME
   const dlChoiceRules = String(getPreferences().xunlei?.dlChoiceRules ?? '');
-  const usageOf = (file: ShareFile): XlUsage => resolveUsage(params.usage, dlChoiceRules, file.fileName);
+  const renameMode: 'none' | 'suffix' | 'strip' =
+    params.renameMode === 'suffix' || params.renameMode === 'strip' ? params.renameMode : 'none';
+  /** 压缩类不重命名时**强制 PLAY**（Tzz 实测：原样只有 PLAY 出链；CONSUME 不给下载地址） */
+  const usageOf = (file: ShareFile): XlUsage => {
+    if (isCompress(file) && renameMode === 'none') return 'PLAY';
+    return resolveUsage(params.usage, dlChoiceRules, file.fileName);
+  };
 
   // v1.4 逐文件进度（只报，不影响结果/顺序）：total = 本批文件数；done = 本批已完成数
   let done = 0;
@@ -342,7 +350,11 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
       sameAccount = true;
       if (d.url) {
         storeDetail(files[i0].fid, d.detail);
-        probed.set(i0, { url: d.url, fileName: files[i0].fileName, size: sizeOfBackend(d, files[i0]), expiresAt: d.expiresAt });
+        // v1.4.1-fix：用户显式选了 rename（suffix/strip）时**不复用探测结果** —— 该文件仍要走
+        // rename → download，否则会绕掉用户选择（压缩类 + PLAY 时探测直接能出链）。
+        if (!(isCompress(files[i0]) && renameMode !== 'none')) {
+          probed.set(i0, { url: d.url, fileName: files[i0].fileName, size: sizeOfBackend(d, files[i0]), expiresAt: d.expiresAt });
+        }
       }
     } catch (err) {
       const code = err instanceof XunleiOpError ? err.code : '';
@@ -419,7 +431,7 @@ async function getDownloadLinks(params: DownloadParams): Promise<DownloadResult[
             errorCode: 'NO_FILE_ID',
           };
         } else {
-          resultByIdx[i] = await fetchOne(files[i], newId, usageOf(files[i]), (stage) => emit(stage, files[i].fid));
+          resultByIdx[i] = await fetchOne(files[i], newId, usageOf(files[i]), renameMode, (stage) => emit(stage, files[i].fid));
         }
       }
       finish(i);

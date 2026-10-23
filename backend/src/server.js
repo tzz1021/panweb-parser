@@ -12,7 +12,7 @@
  * 对外通道全部交给 wrangler / CF（backend 不再暴露任何端口，比旧双 listener 更安全）。
  */
 import { createServer } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,9 +31,13 @@ import {
   xunleiCredentialStatus,
   xunleiSetting,
   xunleiSettingsView,
+  xunleiSignMode,
+  xunleiSignProfile,
+  xunleiSignProfileSelfTest,
   XunleiTokenConfigError,
   XunleiTokenUpstreamError,
 } from './xunlei.js';
+import { SIGN_PROFILE_DEFAULTS, normalizeSignProfile } from './xunlei-sign.js';
 import { captureXunleiCredential } from './xunlei-cdp.js';
 import { bindPort, bindingOf, listPortBindings, unbindPort } from './cdp-bind.js';
 import { listPresets, runPreset, browserHealth } from './presets.js';
@@ -785,7 +789,7 @@ async function handleWebApi(req, res, pathname, body) {
       /* 清扫失败不影响读 */
     }
     const snap = accountsSnapshot();
-    return send(200, { ...snap.data, snapshotAt: snap.at });
+    return send(200, { ...snap.data, snapshotAt: snap.at }, { 'cache-control': 'no-store' });
   }
   if (pathname === '/api/web/accounts/refresh' && req.method === 'POST') {
     refreshAccountsSnapshot();
@@ -869,6 +873,42 @@ async function handleWebApi(req, res, pathname, body) {
     } catch (err) {
       return send(400, { error: 'BAD_HOST', message: err.message });
     }
+  }
+
+  // ---- v1.4.1-fix 迅雷签名 profile（面板：实时计算 / 热加载） ----
+  if (pathname === '/api/web/xunlei/sign-profile') {
+    if (req.method === 'GET') {
+      return send(200, {
+        ok: true,
+        mode: xunleiSignMode(),
+        profile: xunleiSignProfile(),
+        defaults: SIGN_PROFILE_DEFAULTS,
+        deviceId: xunleiSetting('device_id'),
+        selfTest: xunleiSignProfileSelfTest(),
+        note: '大约 20 天官方换一次 salt，没法用了记得改这里；修改后热加载（无需重启）',
+      });
+    }
+    if (req.method === 'POST') {
+      if (!verifyWebuiToken(String(body?.confirmToken ?? ''))) {
+        return send(403, { error: 'CONFIRM_REQUIRED', message: '修改签名 profile 会影响全部 captcha 请求：请二次输入 WebUI 令牌' });
+      }
+      const profile = normalizeSignProfile(body?.profile);
+      setSetting('xunlei_sign_profile', JSON.stringify(profile));
+      if (body?.mode !== undefined) setSetting('xunlei_sign_mode', String(body.mode) === 'manual' ? 'manual' : 'live');
+      if (body?.deviceId === 'regenerate') setSetting('xunlei_device_id', randomBytes(16).toString('hex'));
+      else if (typeof body?.deviceId === 'string' && body.deviceId.trim()) setSetting('xunlei_device_id', body.deviceId.trim());
+      clearXunleiTokenCache(); // sign/device 变了 → 旧 token 不复用
+      audit('xunlei.sign-profile', `mode=${xunleiSignMode()}，version=${profile.client_version}，salts=${profile.salts.length}`, 'webui');
+      log('info', `迅雷签名 profile 已更新（mode=${xunleiSignMode()}，version=${profile.client_version}，salts=${profile.salts.length}）`);
+      return send(200, {
+        ok: true,
+        mode: xunleiSignMode(),
+        profile: xunleiSignProfile(),
+        deviceId: xunleiSetting('device_id'),
+        selfTest: xunleiSignProfileSelfTest(),
+      });
+    }
+    return send(405, { error: 'METHOD_NOT_ALLOWED', message: '仅 GET/POST /api/web/xunlei/sign-profile' });
   }
 
   // ---- 系统配置（高级：严格终端穿透 + devtools 绑定；日志保留期；校验策略说明） ----

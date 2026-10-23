@@ -208,6 +208,8 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
   const [fetchProgress, setFetchProgress] = useState<{ done: number; total: number } | null>(null);
   // v1.4 迅雷取链方案弹窗（批量只弹一次）：自动（按设置规则）/ CONSUME / PLAY
   const [usageChoice, setUsageChoice] = useState<{ files: ShareFile[] } | null>(null);
+  // v1.4.1-fix 压缩包处理（弹窗内选择）：none=原样（仅 PLAY）/ suffix=随机后缀 / strip=抹去后缀
+  const [compressMode, setCompressMode] = useState<'none' | 'suffix' | 'strip'>('none');
   // v1.4 后端断线专属弹窗（op NO_BACKEND / 405 / 501 / 502 等）
   const [backendDown, setBackendDown] = useState(false);
   const [exportKind, setExportKind] = useState<TaskKind>('aria2');
@@ -474,7 +476,12 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
 
   /** 真正执行 prase（每个下载响应下发的 __pugs 与该响应的直链绑定，§12）
    * @param guestMode v1.1.9.final：qk-guestTurn 游客模式（不注入登录态整串） */
-  const doFetchLinks = async (files: ShareFile[], guestMode = false, usage?: 'CONSUME' | 'PLAY'): Promise<void> => {
+  const doFetchLinks = async (
+    files: ShareFile[],
+    guestMode = false,
+    usage?: 'CONSUME' | 'PLAY',
+    renameMode?: 'none' | 'suffix' | 'strip',
+  ): Promise<void> => {
     setFetching(true);
     setFetchProgress({ done: 0, total: files.length });
     let backendDownDetected = false;
@@ -508,6 +515,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
             batchIntervalMs: 1000,
             continueOnError: true,
             usage, // v1.4 迅雷取链方案（弹窗选择；undefined = 适配器按设置规则）
+            renameMode, // v1.4.1-fix 压缩包三态（none/suffix/strip；适配器对压缩类默认 none）
             onProgress: (e) => {
               if (e.done < progLastDone) progBase += progLastDone; // 新批：本批 done 归零 → 累加偏移
               progLastDone = e.done;
@@ -1487,6 +1495,29 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
                 </a>
                 。
               </p>
+              {usageChoice.files.some((f) => ['application/zip', 'application/x-7z-compressed', 'application/x-rar-compressed'].includes(String(f.formatType ?? '').toLowerCase())) && (
+                <div style={{ marginTop: 10 }}>
+                  <p style={{ margin: '0 0 6px', color: 'var(--text-dim)', fontSize: 12.5 }}>
+                    压缩包处理：<strong>原样</strong>仅 PLAY 能出链（不重命名）；重命名后 CONSUME 也能出链
+                  </p>
+                  <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                    {([
+                      ['none', '原样（仅 PLAY，不重命名）'],
+                      ['suffix', '加随机数后缀'],
+                      ['strip', '抹去后缀'],
+                    ] as const).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        className={`btn btn-sm ${compressMode === mode ? 'btn-primary' : ''}`}
+                        onClick={() => setCompressMode(mode)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
                 <button
                   type="button"
@@ -1494,7 +1525,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
                   onClick={() => {
                     const f = usageChoice.files;
                     setUsageChoice(null);
-                    void doFetchLinks(f, false);
+                    void doFetchLinks(f, false, undefined, compressMode);
                   }}
                 >
                   自动（按设置规则）
@@ -1505,7 +1536,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
                   onClick={() => {
                     const f = usageChoice.files;
                     setUsageChoice(null);
-                    void doFetchLinks(f, false, 'CONSUME');
+                    void doFetchLinks(f, false, 'CONSUME', compressMode);
                   }}
                 >
                   CONSUME（默认）
@@ -1516,7 +1547,7 @@ export function ResultPage({ session, onBack, onJump }: ResultPageProps): JSX.El
                   onClick={() => {
                     const f = usageChoice.files;
                     setUsageChoice(null);
-                    void doFetchLinks(f, false, 'PLAY');
+                    void doFetchLinks(f, false, 'PLAY', compressMode);
                   }}
                 >
                   PLAY（流式，通常更快）

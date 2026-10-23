@@ -22,6 +22,7 @@
 | 节奏 | settings → 1s → 批量 restore；**rename 与 download 逐文件、间阅 1s**（download 不可批量）；进度回传前端 |
 | 代理 | 转发层白名单**必须含 `xunlei.com`**（否则 captcha/分享请求在我们自己的代理就被 403 拦掉，表现为「验证码服务 HTTP 403」）；但 **scan 的 captcha 只能本地算，不许从后端取**（否则后端 device_id 暴露/被标记） |
 | 深链 / jumper | `?pwd=&path=<名字链>`：`buildJumpUrl` / `parseJumpUrl` / `resolveJumpPath`（逐层下钻换 fid）已实现；**path 只编码一次** |
+| **签名盐轮换** | 官方约 **20 天换一次盐**（只改盐值与个数）→ 后端已模块化：`backend/src/xunlei-sign.js`（profile）+ **live 模式**实时算 + 面板可改、**热加载**（见 `docs/xunlei-sign.md`） |
 
 ## 1. 分享链接结构
 
@@ -198,7 +199,7 @@ body {"name": "<原名>.<三位补零随机数>", "space": ""} # 不要固定 00
 | 码/字符串 | 场景 | 处理 |
 |---|---|---|
 | `captcha_invalid` | 缺/过期 captcha_token | 重新 `captcha/init` 后重试一次 |
-| `invalid captcha_sign` | init 的 sign 不匹配（盐表/身份混搭） | 检查 client_id/version/package 与盐表是否配套 |
+| `invalid captcha_sign` | sign 不匹配（盐表过期 / sign 与 client_version·package·device 不配套） | 切 live 模式或改 sign profile（见 `docs/xunlei-sign.md`） |
 | `unauthenticated` (HTTP 401) | 未登录打登录态接口 | 提示填写登录态（SPA 临时框 / 账号池） |
 | `9` | captcha 过期（登录态请求） | 以 `action=method:path` 重新 init |
 | `4121/4122/10/16` | access_token 过期 | 刷新 token（或换号） |
@@ -260,3 +261,14 @@ body {"name": "<原名>.<三位补零随机数>", "space": ""} # 不要固定 00
 | 反爬 | 每类请求要 `x-captcha-token`（可自造，300s） | UC/夸克无；阿里无 |
 | 直链 | 必须先转存再 `/files/{id}` 取 `web_content_link` | 阿里同构（转存 + `get_download_url`） |
 | hash | SHA1（本项目丢弃） | 夸克 md5、UC md5、阿里 sha1/crc64 |
+
+## 11. 2026-10-18 修正（换盐 / 压缩包语义）
+
+- **官方又换盐**：web 端已到 `client_version 1.93.10` + **9 条新盐**；旧 8 盐/1.93.6 已失效。
+  实测：同一份 sign 配 `1.93.6` → `400 invalid captcha_sign`；配 `1.93.10` → **200**。
+  现实现：`backend/src/xunlei-sign.js`（profile + `captchaSign` + `selfTest`）+ **live 模式**（默认，实时算、meta 与 profile 同源）+ 面板可改、**热加载**（`docs/xunlei-sign.md`）。
+- **压缩包语义修正**（zip/rar/7z）：
+  - 不改名 + **PLAY** → ①② 正常返回（且 ① 与 ② 在同一次请求里**完全一样**，无优劣）；**PLAY 不需要 rename**；
+  - 不改名 + **CONSUME** → **不给下载地址**（`web_content_link:""`、`links:{}`，只剩在线解压入口）；
+  - 需要 CONSUME 时先 rename（加随机 3 位补零后缀 / 或抹去扩展名）。
+- **速度**与高峰期相关（高峰约 1–2 MB/s，低谷 10 MB/s+），与 `usage` 参数无关，别拿速度归因参数。
